@@ -9,6 +9,8 @@
 //! is required to be a power of two, and the only arithmetic operations
 //! used by buffer operations are addition/subtraction and bitwise-and.
 
+#![no_std]
+
 use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 /// A `Buffer<N>` consists of a `[u8; N]` array along with two `usize`

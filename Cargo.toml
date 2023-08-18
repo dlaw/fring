@@ -1,6 +1,6 @@
 [package]
 name = "fring"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["David Lawrence <dlaw@dlaw.me>"]
 license = "MIT"
