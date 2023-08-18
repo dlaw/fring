@@ -1,0 +1,10 @@
+[package]
+name = "fring"
+version = "0.1.0"
+edition = "2021"
+authors = ["David Lawrence <dlaw@dlaw.me>"]
+license = "MIT"
+repository = "https://github.com/dlaw/fring/"
+description = "Lightweight, no_std, and *fast* ring buffer"
+categories = ["embedded", "no-std"]
+keywords = ["ringbuffer"]
