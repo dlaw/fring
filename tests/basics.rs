@@ -92,3 +92,39 @@ fn data_size() {
     c.read(5);
     assert!(c.data_size() == 0);
 }
+
+#[test]
+fn read_ref() {
+    let mut b: Buffer<4> = Buffer::new();
+    let (mut p, mut c) = b.split();
+    p.write(1)[0] = 0;
+    p.write(1)[0] = 1;
+    p.write(1)[0] = 2;
+    p.write(1)[0] = 3;
+    c.read(1);
+    p.write(1)[0] = 4;
+    let mut r: [u8; 2] = [0, 0];
+    assert!(unsafe { c.read_ref(&mut r) }.is_ok());  // not wrapped around
+    assert!(r == [1, 2]);
+    p.write(1)[0] = 5;
+    assert!(unsafe { c.read_ref(&mut r) }.is_ok());  // wrapped around
+    assert!(r == [3, 4]);
+    assert!(unsafe { c.read_ref(&mut r) }.is_err());  // not enough data
+}
+
+#[test]
+fn write_ref() {
+    let mut b: Buffer<4> = Buffer::new();
+    let (mut p, mut c) = b.split();
+    p.write(1)[0] = 0;
+    let w: [u8; 2] = [1, 2];
+    assert!(p.write_ref(&w).is_ok());  // not wrapped around
+    c.read(1);
+    let w: [u8; 2] = [3, 4];
+    assert!(p.write_ref(&w).is_ok());  // wrapped around
+    assert!(c.read(1)[0] == 1);
+    assert!(p.write_ref(&w).is_err());  // not enough space
+    assert!(c.read(1)[0] == 2);
+    assert!(c.read(1)[0] == 3);
+    assert!(c.read(1)[0] == 4);
+}

@@ -73,8 +73,8 @@ pub struct Buffer<const N: usize> {
 
 /// A `Producer` is a smart pointer to a `Buffer`, which is endowed with
 /// the right to add data into the buffer.  Only one `Producer` may exist
-/// at one time for any given buffer.  Requesting a [`WriteRegion`] from a
-/// `Producer` is the only way to insert data into a `Buffer`.
+/// at one time for any given buffer.  The methods of a `Producer` are the
+/// only way to insert data into a `Buffer`.
 pub struct Producer<'a, const N: usize> {
     buffer: &'a Buffer<N>,
     // The Producer is allowed to increment buffer.tail (up to a maximum
@@ -83,8 +83,8 @@ pub struct Producer<'a, const N: usize> {
 
 /// A `Consumer` is a smart pointer to a `Buffer`, which is endowed with
 /// the right to remove data from the buffer.  Only one `Consumer` may exist
-/// at one time for any given buffer.  Requesting a [`ReadRegion`] from a
-/// `Consumer` is the only way to read data out of a `Buffer`.
+/// at one time for any given buffer.  The methods of a `Consumer` are the
+/// only way to read data out of a `Buffer`.
 pub struct Consumer<'a, const N: usize> {
     buffer: &'a Buffer<N>,
     // The Consumer is allowed to increment buffer.head (up to a maximum
@@ -130,7 +130,8 @@ pub struct ReadRegion<'a, 'b, const N: usize> {
 impl<const N: usize> Buffer<N> {
     /// Return a new, empty buffer.  The memory backing the buffer is zero-initialized.
     pub const fn new() -> Self {
-        assert!(N != 0 && N - 1 & N == 0); // N must be a power of 2
+        // N must be a power of 2. TODO: enforce this at compile time?
+        assert!(N != 0 && N - 1 & N == 0);
         Buffer {
             data: core::cell::UnsafeCell::new([0; N]),
             head: AtomicUsize::new(0),
@@ -144,10 +145,7 @@ impl<const N: usize> Buffer<N> {
     /// returned.  Therefore, for a given buffer, only one producer and one consumer
     /// can exist at one time.
     pub fn split(&mut self) -> (Producer<N>, Consumer<N>) {
-        (
-            Producer { buffer: self },
-            Consumer { buffer: self },
-        )
+        (Producer { buffer: self }, Consumer { buffer: self })
     }
     /// Return a `Producer` associated with this buffer. UNSAFE: the caller must
     /// ensure that at most one `Producer` for this buffer exists at any time.
@@ -187,6 +185,30 @@ impl<'a, const N: usize> Producer<'a, N> {
             region,
         }
     }
+    /// If the buffer has room for `data`, write it into the buffer and return `Ok`.
+    /// Otherwise, return `Err`.
+    pub fn write_ref<T>(&mut self, data: &T) -> Result<(), ()> {
+        let start = self.buffer.tail.load(Relaxed);
+        let end = self.buffer.head.load(Relaxed).wrapping_add(N);
+        let len = core::mem::size_of_val(data);
+        if end.wrapping_sub(start) < len {
+            // not enough room to write a `T`
+            return Err(());
+        }
+        let src = data as *const _ as *const u8;
+        let dst = self.buffer.data.get() as *mut u8;
+        let wrap_len = N - (start & (N - 1));
+        unsafe {
+            if wrap_len >= len {
+                core::ptr::copy_nonoverlapping(src, dst.add(start & (N - 1)), len);
+            } else {
+                core::ptr::copy_nonoverlapping(src, dst.add(start & (N - 1)), wrap_len);
+                core::ptr::copy_nonoverlapping(src.add(wrap_len), dst, len - wrap_len);
+            }
+        }
+        self.buffer.tail.store(start.wrapping_add(len), Relaxed);
+        Ok(())
+    }
     /// Return the amount of empty space currently available in the buffer.
     /// If the consumer is reading concurrently with this call, then the amount
     /// of empty space may increase, but it will not decrease below the value
@@ -211,6 +233,31 @@ impl<'a, const N: usize> Consumer<'a, N> {
             consumer: self,
             region,
         }
+    }
+    /// If the buffer contains enough bytes to make an instance of `T`, then write
+    /// them into `data` and return `Ok`. Otherwise, return `Err`.  UNSAFE: caller
+    /// must guarantee that the bytes contained in the buffer constitute a valid
+    /// instance of `T`.  In consequence, if `T` is an integer type or an integer
+    /// array or slice type, then it is safe to call this function.
+    pub unsafe fn read_ref<T>(&mut self, data: &mut T) -> Result<(), ()> {
+        let start = self.buffer.head.load(Relaxed);
+        let end = self.buffer.tail.load(Relaxed);
+        let len = core::mem::size_of_val(data);
+        if end.wrapping_sub(start) < len {
+            // not enough data to constitute a `T`
+            return Err(());
+        }
+        let src = self.buffer.data.get() as *const u8;
+        let dst = data as *mut _ as *mut u8;
+        let wrap_len = N - (start & (N - 1));
+        if wrap_len >= len {
+            core::ptr::copy_nonoverlapping(src.add(start & (N - 1)), dst, len);
+        } else {
+            core::ptr::copy_nonoverlapping(src.add(start & (N - 1)), dst, wrap_len);
+            core::ptr::copy_nonoverlapping(src, dst.add(wrap_len), len - wrap_len);
+        }
+        self.buffer.head.store(start.wrapping_add(len), Relaxed);
+        Ok(())
     }
     /// Return the amount of data currently stored in the buffer.
     /// If the producer is writing concurrently with this call,
