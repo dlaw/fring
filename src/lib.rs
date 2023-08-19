@@ -1,13 +1,52 @@
 //! Fast ring buffer intended for no_std targets.
 //!
-//! `fring` ("fast ring") is a fast and lightweight circular buffer, designed
-//! for embedded systems and other no_std targets.  The memory footprint
-//! is the buffer itself plus two `usize` indices, and that's it.  The
-//! buffer allows a single producer and a single consumer, which may
+//! `fring` ("fast ring") is a fast and lightweight circular buffer,
+//! designed for embedded systems and other no_std targets.  The memory
+//! footprint is the buffer itself plus two `usize` indices, and that's it.
+//! The buffer allows a single producer and a single consumer, which may
 //! operate concurrently.  Memory safety and thread safety are enforced at
 //! compile time; the buffer is lock-free at runtime.  The buffer length
 //! is required to be a power of two, and the only arithmetic operations
 //! used by buffer operations are addition/subtraction and bitwise and.
+//!
+//! Example of threaded use:
+//! ```rust
+//! # const N: usize = 8;
+//! # fn make_data(_: fring::Producer<N>) {}
+//! # fn use_data(_: fring::Consumer<N>) {}
+//! fn main() {
+//!     let mut buffer = fring::Buffer::<N>::new();
+//!     let (producer, consumer) = buffer.split();
+//!     std::thread::scope(|s| {
+//!         s.spawn(|| {
+//!             make_data(producer);
+//!         });
+//!         use_data(consumer);
+//!     });
+//! }
+//! ```
+//!
+//! Example of static (no_std) use:
+//! ```rust
+//! # const N: usize = 8;
+//! # fn write_data(_: fring::Producer<N>) {}
+//! # fn use_data(_: fring::Consumer<N>) {}
+//! static BUFFER: fring::Buffer<N> = fring::Buffer::new();
+//!
+//! fn interrupt_handler() {
+//!     // UNSAFE: this is safe because this is the only place we ever
+//!     // call BUFFER.producer(), and interrupt_handler() is not reentrant
+//!     let producer = unsafe { BUFFER.producer() };
+//!     write_data(producer);
+//! }
+//!
+//! fn main() {
+//!     // UNSAFE: this is safe because this is the only place we ever
+//!     // call BUFFER.consumer(), and main() is not reentrant
+//!     let consumer = unsafe { BUFFER.consumer() };
+//!     use_data(consumer);
+//! }
+//! ```
 
 #![no_std]
 
@@ -99,16 +138,26 @@ impl<const N: usize> Buffer<N> {
         }
     }
     /// Split the `Buffer` into a `Producer` and a `Consumer`.  This function is the
-    /// only way to use a `Buffer`, and it's also the only way to create a `Producer`
-    /// or a `Consumer`.  This function requires a mutable (i.e. exclusive) reference
-    /// to the buffer, and the lifetime of that reference is equal to the lifetimes of
-    /// the producer and consumer which are returned.  Therefore, for a given buffer,
-    /// only one producer and one consumer can exist at one time.
+    /// only safe way to create a `Producer` or a `Consumer`.  This function requires
+    /// a mutable (i.e. exclusive) reference to the buffer, and the lifetime of that
+    /// reference is equal to the lifetimes of the producer and consumer which are
+    /// returned.  Therefore, for a given buffer, only one producer and one consumer
+    /// can exist at one time.
     pub fn split(&mut self) -> (Producer<N>, Consumer<N>) {
         (
-            Producer::<N> { buffer: self },
-            Consumer::<N> { buffer: self },
+            Producer { buffer: self },
+            Consumer { buffer: self },
         )
+    }
+    /// Return a `Producer` associated with this buffer. UNSAFE: the caller must
+    /// ensure that at most one `Producer` for this buffer exists at any time.
+    pub unsafe fn producer(&self) -> Producer<N> {
+        Producer { buffer: self }
+    }
+    /// Return a `Consumer` associated with this buffer. UNSAFE: the caller must
+    /// ensure that at most one `Consumer` for this buffer exists at any time.
+    pub unsafe fn consumer(&self) -> Consumer<N> {
+        Consumer { buffer: self }
     }
     /// Internal use only. Return a u8 slice starting from `start` and ending at `end`,
     /// except that the slice shall not be longer than `target_len`, and the slice shall
