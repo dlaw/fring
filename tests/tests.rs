@@ -31,6 +31,15 @@ fn read_and_write() {
 }
 
 #[test]
+fn producer_consumer() {
+    let b: Buffer<2> = Buffer::new();
+    let mut p = unsafe { b.producer() };
+    let mut c = unsafe { b.consumer() };
+    p.write(1)[0] = 22;
+    assert!(c.read(1)[0] == 22);
+}
+
+#[test]
 fn wrap_around() {
     let mut b: Buffer<32> = Buffer::new();
     let (mut p, mut c) = b.split();
@@ -127,4 +136,60 @@ fn write_ref() {
     assert!(c.read(1)[0] == 2);
     assert!(c.read(1)[0] == 3);
     assert!(c.read(1)[0] == 4);
+}
+
+#[test]
+fn consume() {
+    let mut b: Buffer<4> = Buffer::new();
+    let (mut p, mut c) = b.split();
+    p.write(1)[0] = 1;
+    p.write(1)[0] = 2;
+    p.write(1)[0] = 3;
+    let mut r = c.read(usize::MAX);
+    assert!(r.len() == 3);
+    r.consume(1);
+    assert!(r.len() == 2);
+    assert!(r[0] == 2);
+    assert!(r[1] == 3);
+}
+
+#[test]
+#[should_panic]
+fn bad_consume() {
+    let mut b: Buffer<4> = Buffer::new();
+    let (mut p, mut c) = b.split();
+    p.write(2);
+    let mut r = c.read(usize::MAX);
+    r.consume(3);
+}
+
+#[test]
+fn partial_drop() {
+    let mut b: Buffer<4> = Buffer::new();
+    let (mut p, c) = b.split();
+    let w = p.write(3);
+    w.partial_drop(1);
+    assert!(c.data_size() == 1);
+}
+
+#[test]
+#[should_panic]
+fn bad_partial_drop() {
+    let mut b: Buffer<4> = Buffer::new();
+    let (mut p, _) = b.split();
+    let w = p.write(2);
+    w.partial_drop(3);
+}
+
+#[test]
+fn zero_sized_ops() {
+    let mut b: Buffer<4> = Buffer::new();
+    let (mut p, mut c) = b.split();
+    p.write(1);
+    let mut r = c.read(0);
+    r.consume(0);
+    r.partial_drop(0);
+    assert!(c.data_size() == 1);
+    p.write(0);
+    assert!(p.empty_size() == 3);
 }

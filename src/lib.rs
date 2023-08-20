@@ -91,40 +91,22 @@ pub struct Consumer<'a, const N: usize> {
     // value of buffer.tail), but may not modify buffer.tail.
 }
 
-/// A `WriteRegion` is a smart pointer to a specific region of data in a
-/// [`Buffer`].  The `WriteRegion` derefs to `[u8]` and may generally be used
-/// in the same way as a slice (e.g. `w[i]`, `w.len()`).  When a `WriteRegion`
-/// is dropped, it updates the associated `Buffer` to indicate that its memory
-/// region now contains data which is ready to be read.  If a `WriteRegion` is
-/// forgotten instead of dropped, the buffer will not be updated and its memory
-/// will be overwritten by the next write to the buffer.
+/// A `Region` is a smart pointer to a specific region of data in a [`Buffer`].
+/// The `Region` derefs to `[u8]` and may generally be used in the same way as
+/// a slice (e.g. `region[i]`, `region.len()`).  When a `Region` is dropped,
+/// it updates the associated `Buffer` to indicate that this memory region now
+/// contains data which is finished being written or finished being read.  If
+/// a `Region` is forgotten instead of dropped, the buffer will not be updated
+/// and the same region will be re-issued by the next read/write.
 ///
-/// Lifetime `'a` is the lifetime of the associated [`Producer`], and lifetime
-/// `'b` is the lifetime of this `WriteRegion`.  These lifetimes enforce the
-/// constraint that each `Producer` can only have a single `WriteRegion` existing
-/// at one time, but the `Producer` outlives the `WriteRegion` and can produce
-/// another `WriteRegion` once this one is dropped.
-pub struct WriteRegion<'a, 'b, const N: usize> {
-    producer: &'b mut Producer<'a, N>,
+/// A Region holds a mutable (i.e. exclusive) reference to its owner `T`, which
+/// is either a `Producer` (for writing to a buffer) or a `Consumer` (for
+/// reading from a buffer). This ensures that at most two regions (one for
+/// reading and one for writing) can exist at any time.
+pub struct Region<'b, T> {
     region: &'b mut [u8],
-}
-
-/// A `ReadRegion` is a smart pointer to a specific region of data in a
-/// [`Buffer`].  The `ReadRegion` derefs to `[u8]` and may generally be used
-/// in the same way as a slice (e.g. `r[i]`, `r.len()`).  When a `ReadRegion`
-/// is dropped, it updates the associated `Buffer` to indicate that the its
-/// memory region may now be overwritten.  If a `ReadRegion` is forgotten
-/// instead of dropped, the buffer will not be updated and its memory will
-/// be read again by the next read from the buffer.
-///
-/// Lifetime `'a` is the lifetime of the associated [`Consumer`], and lifetime
-/// `'b` is the lifetime of this `ReadRegion`.  These lifetimes enforce the
-/// constraint that each `Consumer` can only have a single `ReadRegion` existing
-/// at one time, but the `Consumer` outlives the `ReadRegion` and can produce
-/// another `ReadRegion` once this one is dropped.
-pub struct ReadRegion<'a, 'b, const N: usize> {
-    consumer: &'b mut Consumer<'a, N>,
-    region: &'b mut [u8],
+    index_to_increment: &'b AtomicUsize, // points to Buffer.head or Buffer.tail
+    _owner: &'b mut T,                   // points to a Producer or Consumer
 }
 
 impl<const N: usize> Buffer<N> {
@@ -172,22 +154,22 @@ impl<const N: usize> Buffer<N> {
 }
 
 impl<'a, const N: usize> Producer<'a, N> {
-    /// Return a `WriteRegion` for up to `target_len` bytes to be written into
+    /// Return a `Region` for up to `target_len` bytes to be written into
     /// the buffer. The returned region may be shorter than `target_len`.
     /// The returned region has length zero if and only if the buffer is full.
     /// To write the largest possible length, set `target_len = usize::MAX`.
-    pub fn write<'b>(&'b mut self, target_len: usize) -> WriteRegion<'a, 'b, N> {
+    pub fn write<'b>(&'b mut self, target_len: usize) -> Region<'b, Self> {
         let start = self.buffer.tail.load(Relaxed);
         let end = self.buffer.head.load(Relaxed).wrapping_add(N);
-        let region = unsafe { self.buffer.slice(start, end, target_len) };
-        WriteRegion {
-            producer: self,
-            region,
+        Region {
+            region: unsafe { self.buffer.slice(start, end, target_len) },
+            index_to_increment: &self.buffer.tail,
+            _owner: self,
         }
     }
     /// If the buffer has room for `data`, write it into the buffer and return `Ok`.
     /// Otherwise, return `Err`.
-    pub fn write_ref<T>(&mut self, data: &T) -> Result<(), ()> {
+    pub fn write_ref<T: ?Sized>(&mut self, data: &T) -> Result<(), ()> {
         let start = self.buffer.tail.load(Relaxed);
         let end = self.buffer.head.load(Relaxed).wrapping_add(N);
         let len = core::mem::size_of_val(data);
@@ -221,17 +203,21 @@ impl<'a, const N: usize> Producer<'a, N> {
 }
 
 impl<'a, const N: usize> Consumer<'a, N> {
-    /// Return a `ReadRegion` for up to `target_len` bytes to be read from
+    /// Return a `Region` for up to `target_len` bytes to be read from
     /// the buffer. The returned region may be shorter than `target_len`.
     /// The returned region has length zero if and only if the buffer is empty.
     /// To read the largest possible length, set `target_len = usize::MAX`.
-    pub fn read<'b>(&'b mut self, target_len: usize) -> ReadRegion<'a, 'b, N> {
+    ///
+    /// Even though we are reading from a buffer, the `Region` which is returned
+    /// is mutable.  Its memory is available for arbitrary use by the caller
+    /// for as long as the `Region` remains in scope.
+    pub fn read<'b>(&'b mut self, target_len: usize) -> Region<'b, Self> {
         let start = self.buffer.head.load(Relaxed);
         let end = self.buffer.tail.load(Relaxed);
-        let region = unsafe { self.buffer.slice(start, end, target_len) };
-        ReadRegion {
-            consumer: self,
-            region,
+        Region {
+            region: unsafe { self.buffer.slice(start, end, target_len) },
+            index_to_increment: &self.buffer.head,
+            _owner: self,
         }
     }
     /// If the buffer contains enough bytes to make an instance of `T`, then write
@@ -239,7 +225,7 @@ impl<'a, const N: usize> Consumer<'a, N> {
     /// must guarantee that the bytes contained in the buffer constitute a valid
     /// instance of `T`.  In consequence, if `T` is an integer type or an integer
     /// array or slice type, then it is safe to call this function.
-    pub unsafe fn read_ref<T>(&mut self, data: &mut T) -> Result<(), ()> {
+    pub unsafe fn read_ref<T: ?Sized>(&mut self, data: &mut T) -> Result<(), ()> {
         let start = self.buffer.head.load(Relaxed);
         let end = self.buffer.tail.load(Relaxed);
         let len = core::mem::size_of_val(data);
@@ -278,53 +264,53 @@ impl<'a, const N: usize> Consumer<'a, N> {
     }
 }
 
-/// On drop, a `WriteRegion` updates its associated buffer to
-/// indicate that the memory being written is ready for reading.
-impl<'a, 'b, const N: usize> Drop for WriteRegion<'a, 'b, N> {
-    /// Dropping a `WriteRegion` requires a single addition operation
-    /// to one field of the `Buffer`.
-    fn drop(&mut self) {
-        self.producer
-            .buffer
-            .tail
-            .fetch_add(self.region.len(), Relaxed);
+impl<'b, T> Region<'b, T> {
+    /// Update the buffer to indicate that the first `num` bytes of this region are
+    /// finished being read or written.  The start and length of this region will be
+    /// updated such that the remaining `region.len() - num` bytes remain in this
+    /// region for future reading or writing.
+    pub fn consume(&mut self, num: usize) {
+        assert!(num <= self.region.len());
+        self.index_to_increment.fetch_add(num, Relaxed);
+        // UNSAFE: this is safe because we are replacing self.region with a subslice
+        // of self.region, and it is constrained to keep the same lifetime.
+        self.region = unsafe {
+            core::slice::from_raw_parts_mut(
+                (self.region as *mut _ as *mut u8).add(num),
+                self.region.len() - num,
+            )
+        }
+        // TODO: after https://github.com/rust-lang/rust/issues/62280 is resolved,
+        // use region.take() (safely) instead of making a new slice from raw parts.
+    }
+    /// Update the buffer to indicate that the first `num` bytes of this region are
+    /// finished being read or written, and the remaining `region.len() - num` bytes
+    /// will not be used.  `region.partial_drop(0)` is equivalent to
+    /// `core::mem::forget(region)`.
+    pub fn partial_drop(self, num: usize) {
+        assert!(num <= self.region.len());
+        self.index_to_increment.fetch_add(num, Relaxed);
+        core::mem::forget(self); // don't run drop() now!
     }
 }
 
-/// On drop, a `ReadRegion` updates its associated buffer to
-/// indicate that the memory being read is no longer in use.
-impl<'a, 'b, const N: usize> Drop for ReadRegion<'a, 'b, N> {
-    /// Dropping a `ReadRegion` requires a single addition operation
-    /// to one field of the `Buffer`.
+impl<'b, T> Drop for Region<'b, T> {
+    /// Update the buffer to indicate that the memory being read or written is now
+    /// ready for use. Dropping a `Region` requires a single addition operation to
+    /// one field of the `Buffer`.
     fn drop(&mut self) {
-        self.consumer
-            .buffer
-            .head
-            .fetch_add(self.region.len(), Relaxed);
+        self.index_to_increment.fetch_add(self.region.len(), Relaxed);
     }
 }
 
-impl<'a, 'b, const N: usize> core::ops::Deref for WriteRegion<'a, 'b, N> {
+impl<'b, T> core::ops::Deref for Region<'b, T> {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         self.region
     }
 }
 
-impl<'a, 'b, const N: usize> core::ops::DerefMut for WriteRegion<'a, 'b, N> {
-    fn deref_mut(&mut self) -> &mut [u8] {
-        self.region
-    }
-}
-
-impl<'a, 'b, const N: usize> core::ops::Deref for ReadRegion<'a, 'b, N> {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        self.region
-    }
-}
-
-impl<'a, 'b, const N: usize> core::ops::DerefMut for ReadRegion<'a, 'b, N> {
+impl<'b, T> core::ops::DerefMut for Region<'b, T> {
     fn deref_mut(&mut self) -> &mut [u8] {
         self.region
     }
