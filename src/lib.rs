@@ -94,15 +94,15 @@ pub struct Consumer<'a, const N: usize> {
 /// A `Region` is a smart pointer to a specific region of data in a [`Buffer`].
 /// The `Region` derefs to `[u8]` and may generally be used in the same way as
 /// a slice (e.g. `region[i]`, `region.len()`).  When a `Region` is dropped,
-/// it updates the associated `Buffer` to indicate that this memory region now
-/// contains data which is finished being written or finished being read.  If
-/// a `Region` is forgotten instead of dropped, the buffer will not be updated
-/// and the same region will be re-issued by the next read/write.
+/// it updates the associated `Buffer` to indicate that this section of the
+/// buffer is now finished being read or written.  If a `Region` is forgotten
+/// instead of dropped, the buffer will not be updated and the same region will
+/// be re-issued by the next read/write.
 ///
-/// A Region holds a mutable (i.e. exclusive) reference to its owner `T`, which
-/// is either a `Producer` (for writing to a buffer) or a `Consumer` (for
-/// reading from a buffer). This ensures that at most two regions (one for
-/// reading and one for writing) can exist at any time.
+/// A Region holds a mutable (i.e. exclusive) reference to its owner (of type
+/// `T`), which is either a `Producer` (for writing to a buffer) or a `Consumer`
+/// (for reading from a buffer). This ensures that, for a given buffer, at most
+/// one region for reading and one region for writing can exist at any time.
 pub struct Region<'b, T> {
     region: &'b mut [u8],
     index_to_increment: &'b AtomicUsize, // points to Buffer.head or Buffer.tail
@@ -110,10 +110,14 @@ pub struct Region<'b, T> {
 }
 
 impl<const N: usize> Buffer<N> {
-    /// Return a new, empty buffer.  The memory backing the buffer is zero-initialized.
+    const SIZE_CHECK: () = assert!(
+        (N != 0) && ((N - 1) & N == 0),
+        "buffer size must be a power of 2"
+    );
+    /// Return a new, empty buffer. The memory backing the buffer is zero-initialized.
     pub const fn new() -> Self {
-        // N must be a power of 2. TODO: enforce this at compile time?
-        assert!(N != 0 && N - 1 & N == 0);
+        // Force a compile-time failure if N is not a power of 2.
+        let _ = Self::SIZE_CHECK;
         Buffer {
             data: core::cell::UnsafeCell::new([0; N]),
             head: AtomicUsize::new(0),
@@ -299,7 +303,8 @@ impl<'b, T> Drop for Region<'b, T> {
     /// ready for use. Dropping a `Region` requires a single addition operation to
     /// one field of the `Buffer`.
     fn drop(&mut self) {
-        self.index_to_increment.fetch_add(self.region.len(), Relaxed);
+        self.index_to_increment
+            .fetch_add(self.region.len(), Relaxed);
     }
 }
 

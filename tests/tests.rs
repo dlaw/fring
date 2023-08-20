@@ -1,18 +1,6 @@
 use fring::Buffer;
 
 #[test]
-#[should_panic]
-fn zero_length() {
-    let _b: Buffer<0> = Buffer::new();
-}
-
-#[test]
-#[should_panic]
-fn not_power_of_two_length() {
-    let _b: Buffer<3> = Buffer::new();
-}
-
-#[test]
 fn read_and_write() {
     let mut b: Buffer<2> = Buffer::new();
     let (mut p, mut c) = b.split();
