@@ -103,9 +103,10 @@ pub struct Consumer<'a, const N: usize> {
 /// `T`), which is either a `Producer` (for writing to a buffer) or a `Consumer`
 /// (for reading from a buffer). This ensures that, for a given buffer, at most
 /// one region for reading and one region for writing can exist at any time.
-pub struct Region<'b, T: BufferUser> {
+pub struct Region<'b, T> {
     region: &'b mut [u8], // points to a subslice of Buffer.data
-    owner: &'b mut T,     // points to a Producer or Consumer
+    index_to_increment: &'b AtomicUsize,
+    _owner: &'b mut T,     // points to a Producer or Consumer
 }
 
 impl<const N: usize> Buffer<N> {
@@ -189,37 +190,13 @@ impl<const N: usize> Buffer<N> {
     }
 }
 
-/// A `BufferUser` is either a `Producer` or a `Consumer`.
-pub trait BufferUser {
-    fn indices(&self) -> (usize, usize);
-    fn increment(&self, num: usize);
-}
-
-impl<'a, const N: usize> BufferUser for Producer<'a, N> {
+impl<'a, const N: usize> Producer<'a, N> {
     fn indices(&self) -> (usize, usize) {
         (
             self.buffer.tail.load(Relaxed),
             self.buffer.head.load(Relaxed).wrapping_add(N),
         )
     }
-    fn increment(&self, num: usize) {
-        self.buffer.tail.fetch_add(num, Relaxed);
-    }
-}
-
-impl<'a, const N: usize> BufferUser for Consumer<'a, N> {
-    fn indices(&self) -> (usize, usize) {
-        (
-            self.buffer.head.load(Relaxed),
-            self.buffer.tail.load(Relaxed),
-        )
-    }
-    fn increment(&self, num: usize) {
-        self.buffer.head.fetch_add(num, Relaxed);
-    }
-}
-
-impl<'a, const N: usize> Producer<'a, N> {
     /// Return a `Region` for up to `target_len` bytes to be written into
     /// the buffer. The returned region may be shorter than `target_len`.
     /// The returned region has length zero if and only if the buffer is full.
@@ -227,7 +204,8 @@ impl<'a, const N: usize> Producer<'a, N> {
     pub fn write<'b>(&'b mut self, target_len: usize) -> Region<'b, Self> {
         Region {
             region: unsafe { self.buffer.slice(self.indices(), target_len) },
-            owner: self,
+            index_to_increment: &self.buffer.tail,
+            _owner: self,
         }
     }
     /// If the buffer has room for `data`, write it into the buffer and return `Ok`.
@@ -241,7 +219,7 @@ impl<'a, const N: usize> Producer<'a, N> {
             let (src0, src1) = src.split_at(dst[0].len());
             dst[0].copy_from_slice(src0);
             dst[1].copy_from_slice(src1);
-            self.increment(src.len());
+            self.buffer.tail.fetch_add(src.len(), Relaxed);
             Ok(())
         } else {
             Err(())
@@ -258,6 +236,12 @@ impl<'a, const N: usize> Producer<'a, N> {
 }
 
 impl<'a, const N: usize> Consumer<'a, N> {
+    fn indices(&self) -> (usize, usize) {
+        (
+            self.buffer.head.load(Relaxed),
+            self.buffer.tail.load(Relaxed),
+        )
+    }
     /// Return a `Region` for up to `target_len` bytes to be read from
     /// the buffer. The returned region may be shorter than `target_len`.
     /// The returned region has length zero if and only if the buffer is empty.
@@ -269,7 +253,8 @@ impl<'a, const N: usize> Consumer<'a, N> {
     pub fn read<'b>(&'b mut self, target_len: usize) -> Region<'b, Self> {
         Region {
             region: unsafe { self.buffer.slice(self.indices(), target_len) },
-            owner: self,
+            index_to_increment: &self.buffer.head,
+            _owner: self,
         }
     }
     /// If the buffer contains enough bytes to make an instance of `T`, then write
@@ -286,7 +271,7 @@ impl<'a, const N: usize> Consumer<'a, N> {
             let (dst0, dst1) = dst.split_at_mut(src[0].len());
             dst0.copy_from_slice(src[0]);
             dst1.copy_from_slice(src[1]);
-            self.increment(dst.len());
+            self.buffer.head.fetch_add(dst.len(), Relaxed);
             Ok(())
         } else {
             Err(())
@@ -310,14 +295,14 @@ impl<'a, const N: usize> Consumer<'a, N> {
     }
 }
 
-impl<'b, T: BufferUser> Region<'b, T> {
+impl<'b, T> Region<'b, T> {
     /// Update the buffer to indicate that the first `num` bytes of this region are
     /// finished being read or written.  The start and length of this region will be
     /// updated such that the remaining `region.len() - num` bytes remain in this
     /// region for future reading or writing.
     pub fn consume(&mut self, num: usize) {
         assert!(num <= self.region.len());
-        self.owner.increment(num);
+        self.index_to_increment.fetch_add(num, Relaxed);
         // UNSAFE: this is safe because we are replacing self.region with a subslice
         // of self.region, and it is constrained to keep the same lifetime.
         self.region = unsafe {
@@ -333,28 +318,28 @@ impl<'b, T: BufferUser> Region<'b, T> {
     /// `core::mem::forget(region)`.
     pub fn partial_drop(self, num: usize) {
         assert!(num <= self.region.len());
-        self.owner.increment(num);
+        self.index_to_increment.fetch_add(num, Relaxed);
         core::mem::forget(self); // don't run drop() now!
     }
 }
 
-impl<'b, T: BufferUser> Drop for Region<'b, T> {
+impl<'b, T> Drop for Region<'b, T> {
     /// Update the buffer to indicate that the memory being read or written is now
     /// ready for use. Dropping a `Region` requires a single addition operation to
     /// one field of the `Buffer`.
     fn drop(&mut self) {
-        self.owner.increment(self.region.len());
+        self.index_to_increment.fetch_add(self.region.len(), Relaxed);
     }
 }
 
-impl<'b, T: BufferUser> core::ops::Deref for Region<'b, T> {
+impl<'b, T> core::ops::Deref for Region<'b, T> {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         self.region
     }
 }
 
-impl<'b, T: BufferUser> core::ops::DerefMut for Region<'b, T> {
+impl<'b, T> core::ops::DerefMut for Region<'b, T> {
     fn deref_mut(&mut self) -> &mut [u8] {
         self.region
     }
