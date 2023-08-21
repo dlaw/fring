@@ -103,10 +103,9 @@ pub struct Consumer<'a, const N: usize> {
 /// `T`), which is either a `Producer` (for writing to a buffer) or a `Consumer`
 /// (for reading from a buffer). This ensures that, for a given buffer, at most
 /// one region for reading and one region for writing can exist at any time.
-pub struct Region<'b, T> {
-    region: &'b mut [u8],
-    index_to_increment: &'b AtomicUsize, // points to Buffer.head or Buffer.tail
-    _owner: &'b mut T,                   // points to a Producer or Consumer
+pub struct Region<'b, T: BufferUser> {
+    region: &'b mut [u8], // points to a subslice of Buffer.data
+    owner: &'b mut T,     // points to a Producer or Consumer
 }
 
 impl<const N: usize> Buffer<N> {
@@ -143,17 +142,80 @@ impl<const N: usize> Buffer<N> {
     pub unsafe fn consumer(&self) -> Consumer<N> {
         Consumer { buffer: self }
     }
-    /// Internal use only. Return a u8 slice starting from `start` and ending at `end`,
+}
+
+impl<const N: usize> Buffer<N> {
+    #[inline(always)]
+    fn calc_pointers(&self, indices: (usize, usize), target_len: usize) -> (*mut u8, usize, usize) {
+        // length calculations which are shared between `slice()` and `split_slice()`
+        let (start, end) = indices;
+        (
+            // points to the element of Buffer.data at position `start`
+            unsafe { (self.data.get() as *mut u8).add(start & (N - 1)) },
+            // maximum length from `start` which doesn't wrap around
+            N - (start & (N - 1)),
+            // maximum length <= `target_len` which fits between `start` and `end`
+            core::cmp::min(target_len, end.wrapping_sub(start)),
+        )
+    }
+    /// Internal use only. Return a u8 slice extending from `indices.0` to `indices.1`,
     /// except that the slice shall not be longer than `target_len`, and the slice shall
-    /// not wrap around the end of the buffer.  `start` and `end` are wrapped to the
+    /// not wrap around the end of the buffer.  Start and end indices are wrapped to the
     /// buffer length.  UNSAFE: caller is responsible for ensuring that overlapping
     /// slices are never created, since we return a mutable (i.e. exclusive) slice.
-    unsafe fn slice(&self, start: usize, end: usize, target_len: usize) -> &mut [u8] {
-        let start_ptr = (self.data.get() as *mut u8).add(start & (N - 1));
-        let wrap_len = N - (start & (N - 1)); // longest length that doesn't wrap around
-        let max_len = end.wrapping_sub(start); // longest length that doesn't pass `end`
-        let len = core::cmp::min(target_len, core::cmp::min(max_len, wrap_len));
-        core::slice::from_raw_parts_mut(start_ptr, len)
+    unsafe fn slice(&self, indices: (usize, usize), target_len: usize) -> &mut [u8] {
+        let (start_ptr, wrap_len, len) = self.calc_pointers(indices, target_len);
+        core::slice::from_raw_parts_mut(start_ptr, core::cmp::min(len, wrap_len))
+    }
+    /// Internal use only. Return a pair of u8 slices which are logically contiguous in
+    /// the buffer, extending from `indices.0` to `indices.1`, except that the total
+    /// length shall not exceed `target_len`. Start and end indices are wrapped to the
+    /// buffer length.  UNSAFE: caller is responsible for ensuring that overlapping
+    /// slices are never created, since we return mutable (i.e. exclusive) slices.
+    unsafe fn split_slice(&self, indices: (usize, usize), target_len: usize) -> [&mut [u8]; 2] {
+        let (start_ptr, wrap_len, len) = self.calc_pointers(indices, target_len);
+        if len <= wrap_len {
+            [
+                core::slice::from_raw_parts_mut(start_ptr, 0),
+                core::slice::from_raw_parts_mut(start_ptr, len),
+            ]
+        } else {
+            let data_ptr = self.data.get() as *mut u8;
+            [
+                core::slice::from_raw_parts_mut(start_ptr, wrap_len),
+                core::slice::from_raw_parts_mut(data_ptr, len - wrap_len),
+            ]
+        }
+    }
+}
+
+/// A `BufferUser` is either a `Producer` or a `Consumer`.
+pub trait BufferUser {
+    fn indices(&self) -> (usize, usize);
+    fn increment(&self, num: usize);
+}
+
+impl<'a, const N: usize> BufferUser for Producer<'a, N> {
+    fn indices(&self) -> (usize, usize) {
+        (
+            self.buffer.tail.load(Relaxed),
+            self.buffer.head.load(Relaxed).wrapping_add(N),
+        )
+    }
+    fn increment(&self, num: usize) {
+        self.buffer.tail.fetch_add(num, Relaxed);
+    }
+}
+
+impl<'a, const N: usize> BufferUser for Consumer<'a, N> {
+    fn indices(&self) -> (usize, usize) {
+        (
+            self.buffer.head.load(Relaxed),
+            self.buffer.tail.load(Relaxed),
+        )
+    }
+    fn increment(&self, num: usize) {
+        self.buffer.head.fetch_add(num, Relaxed);
     }
 }
 
@@ -163,45 +225,34 @@ impl<'a, const N: usize> Producer<'a, N> {
     /// The returned region has length zero if and only if the buffer is full.
     /// To write the largest possible length, set `target_len = usize::MAX`.
     pub fn write<'b>(&'b mut self, target_len: usize) -> Region<'b, Self> {
-        let start = self.buffer.tail.load(Relaxed);
-        let end = self.buffer.head.load(Relaxed).wrapping_add(N);
         Region {
-            region: unsafe { self.buffer.slice(start, end, target_len) },
-            index_to_increment: &self.buffer.tail,
-            _owner: self,
+            region: unsafe { self.buffer.slice(self.indices(), target_len) },
+            owner: self,
         }
     }
     /// If the buffer has room for `data`, write it into the buffer and return `Ok`.
     /// Otherwise, return `Err`.
     pub fn write_ref<T: ?Sized>(&mut self, data: &T) -> Result<(), ()> {
-        let start = self.buffer.tail.load(Relaxed);
-        let end = self.buffer.head.load(Relaxed).wrapping_add(N);
-        let len = core::mem::size_of_val(data);
-        if end.wrapping_sub(start) < len {
-            // not enough room to write a `T`
-            return Err(());
+        let src = unsafe {
+            core::slice::from_raw_parts(data as *const _ as *const u8, core::mem::size_of_val(data))
+        };
+        let dst = unsafe { self.buffer.split_slice(self.indices(), src.len()) };
+        if dst[0].len() + dst[1].len() == src.len() {
+            let (src0, src1) = src.split_at(dst[0].len());
+            dst[0].copy_from_slice(src0);
+            dst[1].copy_from_slice(src1);
+            self.increment(src.len());
+            Ok(())
+        } else {
+            Err(())
         }
-        let src = data as *const _ as *const u8;
-        let dst = self.buffer.data.get() as *mut u8;
-        let wrap_len = N - (start & (N - 1));
-        unsafe {
-            if wrap_len >= len {
-                core::ptr::copy_nonoverlapping(src, dst.add(start & (N - 1)), len);
-            } else {
-                core::ptr::copy_nonoverlapping(src, dst.add(start & (N - 1)), wrap_len);
-                core::ptr::copy_nonoverlapping(src.add(wrap_len), dst, len - wrap_len);
-            }
-        }
-        self.buffer.tail.store(start.wrapping_add(len), Relaxed);
-        Ok(())
     }
     /// Return the amount of empty space currently available in the buffer.
     /// If the consumer is reading concurrently with this call, then the amount
     /// of empty space may increase, but it will not decrease below the value
     /// which is returned.
     pub fn empty_size(&self) -> usize {
-        let start = self.buffer.tail.load(Relaxed);
-        let end = self.buffer.head.load(Relaxed).wrapping_add(N);
+        let (start, end) = self.indices();
         end.wrapping_sub(start)
     }
 }
@@ -216,12 +267,9 @@ impl<'a, const N: usize> Consumer<'a, N> {
     /// is mutable.  Its memory is available for arbitrary use by the caller
     /// for as long as the `Region` remains in scope.
     pub fn read<'b>(&'b mut self, target_len: usize) -> Region<'b, Self> {
-        let start = self.buffer.head.load(Relaxed);
-        let end = self.buffer.tail.load(Relaxed);
         Region {
-            region: unsafe { self.buffer.slice(start, end, target_len) },
-            index_to_increment: &self.buffer.head,
-            _owner: self,
+            region: unsafe { self.buffer.slice(self.indices(), target_len) },
+            owner: self,
         }
     }
     /// If the buffer contains enough bytes to make an instance of `T`, then write
@@ -229,33 +277,27 @@ impl<'a, const N: usize> Consumer<'a, N> {
     /// must guarantee that the bytes contained in the buffer constitute a valid
     /// instance of `T`.  In consequence, if `T` is an integer type or an integer
     /// array or slice type, then it is safe to call this function.
-    pub unsafe fn read_ref<T: ?Sized>(&mut self, data: &mut T) -> Result<(), ()> {
-        let start = self.buffer.head.load(Relaxed);
-        let end = self.buffer.tail.load(Relaxed);
-        let len = core::mem::size_of_val(data);
-        if end.wrapping_sub(start) < len {
-            // not enough data to constitute a `T`
-            return Err(());
-        }
-        let src = self.buffer.data.get() as *const u8;
-        let dst = data as *mut _ as *mut u8;
-        let wrap_len = N - (start & (N - 1));
-        if wrap_len >= len {
-            core::ptr::copy_nonoverlapping(src.add(start & (N - 1)), dst, len);
+    pub unsafe fn read_ref<T: Copy + ?Sized>(&mut self, data: &mut T) -> Result<(), ()> {
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(data as *mut _ as *mut u8, core::mem::size_of_val(data))
+        };
+        let src = unsafe { self.buffer.split_slice(self.indices(), dst.len()) };
+        if src[0].len() + src[1].len() == dst.len() {
+            let (dst0, dst1) = dst.split_at_mut(src[0].len());
+            dst0.copy_from_slice(src[0]);
+            dst1.copy_from_slice(src[1]);
+            self.increment(dst.len());
+            Ok(())
         } else {
-            core::ptr::copy_nonoverlapping(src.add(start & (N - 1)), dst, wrap_len);
-            core::ptr::copy_nonoverlapping(src, dst.add(wrap_len), len - wrap_len);
+            Err(())
         }
-        self.buffer.head.store(start.wrapping_add(len), Relaxed);
-        Ok(())
     }
     /// Return the amount of data currently stored in the buffer.
     /// If the producer is writing concurrently with this call,
     /// then the amount of data may increase, but it will not
     /// decrease below the value which is returned.
     pub fn data_size(&self) -> usize {
-        let start = self.buffer.head.load(Relaxed);
-        let end = self.buffer.tail.load(Relaxed);
+        let (start, end) = self.indices();
         end.wrapping_sub(start)
     }
     /// Discard all data which is currently stored in the buffer.
@@ -268,24 +310,22 @@ impl<'a, const N: usize> Consumer<'a, N> {
     }
 }
 
-impl<'b, T> Region<'b, T> {
+impl<'b, T: BufferUser> Region<'b, T> {
     /// Update the buffer to indicate that the first `num` bytes of this region are
     /// finished being read or written.  The start and length of this region will be
     /// updated such that the remaining `region.len() - num` bytes remain in this
     /// region for future reading or writing.
     pub fn consume(&mut self, num: usize) {
         assert!(num <= self.region.len());
-        self.index_to_increment.fetch_add(num, Relaxed);
+        self.owner.increment(num);
         // UNSAFE: this is safe because we are replacing self.region with a subslice
         // of self.region, and it is constrained to keep the same lifetime.
         self.region = unsafe {
             core::slice::from_raw_parts_mut(
-                (self.region as *mut _ as *mut u8).add(num),
+                self.region.as_mut_ptr().add(num),
                 self.region.len() - num,
             )
         }
-        // TODO: after https://github.com/rust-lang/rust/issues/62280 is resolved,
-        // use region.take() (safely) instead of making a new slice from raw parts.
     }
     /// Update the buffer to indicate that the first `num` bytes of this region are
     /// finished being read or written, and the remaining `region.len() - num` bytes
@@ -293,29 +333,28 @@ impl<'b, T> Region<'b, T> {
     /// `core::mem::forget(region)`.
     pub fn partial_drop(self, num: usize) {
         assert!(num <= self.region.len());
-        self.index_to_increment.fetch_add(num, Relaxed);
+        self.owner.increment(num);
         core::mem::forget(self); // don't run drop() now!
     }
 }
 
-impl<'b, T> Drop for Region<'b, T> {
+impl<'b, T: BufferUser> Drop for Region<'b, T> {
     /// Update the buffer to indicate that the memory being read or written is now
     /// ready for use. Dropping a `Region` requires a single addition operation to
     /// one field of the `Buffer`.
     fn drop(&mut self) {
-        self.index_to_increment
-            .fetch_add(self.region.len(), Relaxed);
+        self.owner.increment(self.region.len());
     }
 }
 
-impl<'b, T> core::ops::Deref for Region<'b, T> {
+impl<'b, T: BufferUser> core::ops::Deref for Region<'b, T> {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         self.region
     }
 }
 
-impl<'b, T> core::ops::DerefMut for Region<'b, T> {
+impl<'b, T: BufferUser> core::ops::DerefMut for Region<'b, T> {
     fn deref_mut(&mut self) -> &mut [u8] {
         self.region
     }
