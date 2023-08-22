@@ -109,6 +109,13 @@ pub struct Region<'b, T> {
     _owner: &'b mut T,                   // points to a Producer or Consumer
 }
 
+/// TODO
+pub struct SplitRegion<'b, T> {
+    regions: [&'b mut [u8]; 2],          // points to subslices of Buffer.data
+    index_to_increment: &'b AtomicUsize, // points to Buffer.head or Buffer.tail
+    _owner: &'b mut T,                   // points to a Producer or Consumer
+}
+
 impl<const N: usize> Buffer<N> {
     const SIZE_CHECK: () = assert!(
         (N != 0) && ((N - 1) & N == 0),
@@ -190,6 +197,11 @@ impl<const N: usize> Buffer<N> {
     }
 }
 
+unsafe impl<const N: usize> Send for Buffer<N> {}
+/// `Buffer<N>` is `Send` and `Sync` because accesses to its internal data are
+/// only possible via a single `Producer` and a single `Consumer` at any time.
+unsafe impl<const N: usize> Sync for Buffer<N> {}
+
 impl<'a, const N: usize> Producer<'a, N> {
     fn indices(&self) -> [usize; 2] {
         [
@@ -204,6 +216,14 @@ impl<'a, const N: usize> Producer<'a, N> {
     pub fn write<'b>(&'b mut self, target_len: usize) -> Region<'b, Self> {
         Region {
             region: unsafe { self.buffer.slice(self.indices(), target_len) },
+            index_to_increment: &self.buffer.tail,
+            _owner: self,
+        }
+    }
+    /// TODO
+    pub fn split_write<'b>(&'b mut self, target_len: usize) -> SplitRegion<'b, Self> {
+        SplitRegion {
+            regions: unsafe { self.buffer.split_slice(self.indices(), target_len) },
             index_to_increment: &self.buffer.tail,
             _owner: self,
         }
@@ -257,6 +277,14 @@ impl<'a, const N: usize> Consumer<'a, N> {
             _owner: self,
         }
     }
+    /// TODO
+    pub fn split_read<'b>(&'b mut self, target_len: usize) -> SplitRegion<'b, Self> {
+        SplitRegion {
+            regions: unsafe { self.buffer.split_slice(self.indices(), target_len) },
+            index_to_increment: &self.buffer.head,
+            _owner: self,
+        }
+    }
     /// If the buffer contains enough bytes to make an instance of `T`, then write
     /// them into `data` and return `Ok`. Otherwise, return `Err`.  UNSAFE: caller
     /// must guarantee that the bytes contained in the buffer constitute a valid
@@ -301,7 +329,7 @@ impl<'b, T> Region<'b, T> {
     /// updated such that the remaining `region.len() - num` bytes remain in this
     /// region for future reading or writing.
     pub fn consume(&mut self, num: usize) {
-        assert!(num <= self.region.len());
+        assert!(num <= self.len());
         self.index_to_increment.fetch_add(num, Relaxed);
         // UNSAFE: this is safe because we are replacing self.region with a subslice
         // of self.region, and it is constrained to keep the same lifetime.
@@ -317,7 +345,7 @@ impl<'b, T> Region<'b, T> {
     /// will not be used.  `region.partial_drop(0)` is equivalent to
     /// `core::mem::forget(region)`.
     pub fn partial_drop(self, num: usize) {
-        assert!(num <= self.region.len());
+        assert!(num <= self.len());
         self.index_to_increment.fetch_add(num, Relaxed);
         core::mem::forget(self); // don't run drop() now!
     }
@@ -328,7 +356,7 @@ impl<'b, T> Drop for Region<'b, T> {
     /// ready for use. Dropping a `Region` requires a single addition operation to
     /// one field of the `Buffer`.
     fn drop(&mut self) {
-        self.index_to_increment.fetch_add(self.region.len(), Relaxed);
+        self.index_to_increment.fetch_add(self.len(), Relaxed);
     }
 }
 
@@ -345,10 +373,72 @@ impl<'b, T> core::ops::DerefMut for Region<'b, T> {
     }
 }
 
-unsafe impl<const N: usize> Send for Buffer<N> {}
-/// `Buffer<N>` is `Send` and `Sync` because accesses to its internal data are
-/// only possible via a single `Producer` and a single `Consumer` at any time.
-unsafe impl<const N: usize> Sync for Buffer<N> {}
+impl<'b, T> SplitRegion<'b, T> {
+    pub fn len(&self) -> usize {
+        self.regions[0].len() + self.regions[1].len()
+    }
+    /// Update the buffer to indicate that the first `num` bytes of this region are
+    /// finished being read or written.  The start and length of this region will be
+    /// updated such that the remaining `region.len() - num` bytes remain in this
+    /// region for future reading or writing.
+    /*
+    pub fn consume(&mut self, num: usize) {
+        assert!(num <= self.region.len());
+        self.index_to_increment.fetch_add(num, Relaxed);
+        // UNSAFE: this is safe because we are replacing self.region with a subslice
+        // of self.region, and it is constrained to keep the same lifetime.
+        self.region = unsafe {
+            core::slice::from_raw_parts_mut(
+                self.region.as_mut_ptr().add(num),
+                self.region.len() - num,
+            )
+        }
+    }
+    */
+    /// Update the buffer to indicate that the first `num` bytes of this region are
+    /// finished being read or written, and the remaining `region.len() - num` bytes
+    /// will not be used.  `region.partial_drop(0)` is equivalent to
+    /// `core::mem::forget(region)`.
+    pub fn partial_drop(self, num: usize) {
+        assert!(num <= self.len());
+        self.index_to_increment.fetch_add(num, Relaxed);
+        core::mem::forget(self); // don't run drop() now!
+    }
+}
+
+impl<'b, T> Drop for SplitRegion<'b, T> {
+    /// Update the buffer to indicate that the memory being read or written is now
+    /// ready for use. Dropping a `Region` requires a single addition operation to
+    /// one field of the `Buffer`.
+    fn drop(&mut self) {
+        self.index_to_increment.fetch_add(self.len(), Relaxed);
+    }
+}
+
+impl<'b, T> core::ops::Index<usize> for SplitRegion<'b, T> {
+    type Output = u8;
+    fn index(&self, index: usize) -> &u8 {
+        if index < self.regions[0].len() {
+            &self.regions[0][index]
+        } else if index < self.len() {
+            &self.regions[1][index - self.regions[0].len()]
+        } else {
+            panic!("index out of bounds")
+        }
+    }
+}
+
+impl<'b, T> core::ops::IndexMut<usize> for SplitRegion<'b, T> {
+    fn index_mut(&mut self, index: usize) -> &mut u8 {
+        if index < self.regions[0].len() {
+            &mut self.regions[0][index]
+        } else if index < self.len() {
+            &mut self.regions[1][index - self.regions[0].len()]
+        } else {
+            panic!("index out of bounds")
+        }
+    }
+}
 
 #[test]
 fn index_wraparound() {
