@@ -4,8 +4,9 @@
 //! for embedded systems and other no_std targets.  ("Circular buffer" means
 //! it is a FIFO queue, stored as an array, and the data wraps back to the
 //! beginning of the array once it reaches the end.)  The memory footprint of
-//! a `fring::Buffer` is the buffer itself plus two `usize` indices, and that's
-//! it. The buffer allows a single producer and a single consumer, which may
+//! a `fring::Buffer` is the buffer itself plus two `usize` indices.
+//!
+//! The buffer allows a single producer and a single consumer, which may
 //! operate concurrently.  Memory safety and thread safety are enforced at
 //! compile time; the buffer is lock-free at runtime.  The buffer length is
 //! required to be a power of two, and the only arithmetic operations used by
@@ -13,7 +14,7 @@
 //!
 //! The only way to use a [`Buffer`] is to split it into a [`Producer`] and a
 //! [`Consumer`].  Then one may call `Producer.write()` and `Consumer.read()`,
-//! or various other methods which are provided by `Producer` and `Consumer.
+//! or various other methods which are provided by `Producer` and `Consumer`.
 //!
 //! Example of safe threaded use:
 //! ```rust
@@ -213,6 +214,7 @@ impl<'a, const N: usize> Producer<'a, N> {
     /// Return a `Region` for up to `target_len` bytes to be written into
     /// the buffer. The returned region may be shorter than `target_len`.
     /// The returned region has length zero if and only if the buffer is full.
+    /// The returned region is guaranteed to be not longer than `target_len`.
     /// To write the largest possible length, set `target_len = usize::MAX`.
     pub fn write<'b>(&'b mut self, target_len: usize) -> Region<'b, Self> {
         Region {
@@ -258,6 +260,7 @@ impl<'a, const N: usize> Consumer<'a, N> {
     /// Return a `Region` for up to `target_len` bytes to be read from
     /// the buffer. The returned region may be shorter than `target_len`.
     /// The returned region has length zero if and only if the buffer is empty.
+    /// The returned region is guaranteed to be not longer than `target_len`.
     /// To read the largest possible length, set `target_len = usize::MAX`.
     ///
     /// Even though we are reading from the buffer, the `Region` which is returned
