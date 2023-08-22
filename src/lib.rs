@@ -104,9 +104,9 @@ pub struct Consumer<'a, const N: usize> {
 /// (for reading from a buffer). This ensures that, for a given buffer, at most
 /// one region for reading and one region for writing can exist at any time.
 pub struct Region<'b, T> {
-    region: &'b mut [u8], // points to a subslice of Buffer.data
-    index_to_increment: &'b AtomicUsize,
-    _owner: &'b mut T,     // points to a Producer or Consumer
+    region: &'b mut [u8],                // points to a subslice of Buffer.data
+    index_to_increment: &'b AtomicUsize, // points to Buffer.head or Buffer.tail
+    _owner: &'b mut T,                   // points to a Producer or Consumer
 }
 
 impl<const N: usize> Buffer<N> {
@@ -147,9 +147,9 @@ impl<const N: usize> Buffer<N> {
 
 impl<const N: usize> Buffer<N> {
     #[inline(always)]
-    fn calc_pointers(&self, indices: (usize, usize), target_len: usize) -> (*mut u8, usize, usize) {
+    fn calc_pointers(&self, indices: [usize; 2], target_len: usize) -> (*mut u8, usize, usize) {
         // length calculations which are shared between `slice()` and `split_slice()`
-        let (start, end) = indices;
+        let [start, end] = indices;
         (
             // points to the element of Buffer.data at position `start`
             unsafe { (self.data.get() as *mut u8).add(start & (N - 1)) },
@@ -164,7 +164,7 @@ impl<const N: usize> Buffer<N> {
     /// not wrap around the end of the buffer.  Start and end indices are wrapped to the
     /// buffer length.  UNSAFE: caller is responsible for ensuring that overlapping
     /// slices are never created, since we return a mutable (i.e. exclusive) slice.
-    unsafe fn slice(&self, indices: (usize, usize), target_len: usize) -> &mut [u8] {
+    unsafe fn slice(&self, indices: [usize; 2], target_len: usize) -> &mut [u8] {
         let (start_ptr, wrap_len, len) = self.calc_pointers(indices, target_len);
         core::slice::from_raw_parts_mut(start_ptr, core::cmp::min(len, wrap_len))
     }
@@ -173,7 +173,7 @@ impl<const N: usize> Buffer<N> {
     /// length shall not exceed `target_len`. Start and end indices are wrapped to the
     /// buffer length.  UNSAFE: caller is responsible for ensuring that overlapping
     /// slices are never created, since we return mutable (i.e. exclusive) slices.
-    unsafe fn split_slice(&self, indices: (usize, usize), target_len: usize) -> [&mut [u8]; 2] {
+    unsafe fn split_slice(&self, indices: [usize; 2], target_len: usize) -> [&mut [u8]; 2] {
         let (start_ptr, wrap_len, len) = self.calc_pointers(indices, target_len);
         if len <= wrap_len {
             [
@@ -191,11 +191,11 @@ impl<const N: usize> Buffer<N> {
 }
 
 impl<'a, const N: usize> Producer<'a, N> {
-    fn indices(&self) -> (usize, usize) {
-        (
+    fn indices(&self) -> [usize; 2] {
+        [
             self.buffer.tail.load(Relaxed),
             self.buffer.head.load(Relaxed).wrapping_add(N),
-        )
+        ]
     }
     /// Return a `Region` for up to `target_len` bytes to be written into
     /// the buffer. The returned region may be shorter than `target_len`.
@@ -230,17 +230,17 @@ impl<'a, const N: usize> Producer<'a, N> {
     /// of empty space may increase, but it will not decrease below the value
     /// which is returned.
     pub fn empty_size(&self) -> usize {
-        let (start, end) = self.indices();
+        let [start, end] = self.indices();
         end.wrapping_sub(start)
     }
 }
 
 impl<'a, const N: usize> Consumer<'a, N> {
-    fn indices(&self) -> (usize, usize) {
-        (
+    fn indices(&self) -> [usize; 2] {
+        [
             self.buffer.head.load(Relaxed),
             self.buffer.tail.load(Relaxed),
-        )
+        ]
     }
     /// Return a `Region` for up to `target_len` bytes to be read from
     /// the buffer. The returned region may be shorter than `target_len`.
@@ -282,7 +282,7 @@ impl<'a, const N: usize> Consumer<'a, N> {
     /// then the amount of data may increase, but it will not
     /// decrease below the value which is returned.
     pub fn data_size(&self) -> usize {
-        let (start, end) = self.indices();
+        let [start, end] = self.indices();
         end.wrapping_sub(start)
     }
     /// Discard all data which is currently stored in the buffer.
