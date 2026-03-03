@@ -65,8 +65,8 @@ use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 /// A `Buffer<N>` can hold `N` bytes of data and guarantees FIFO ordering.
 /// The only way to use a `Buffer` is to split it into a [`Producer`] and a
 /// [`Consumer`], which may then be passed to different threads or contexts.
-pub struct Buffer<const N: usize> {
-    data: core::cell::UnsafeCell<[u8; N]>,
+pub struct Buffer<T: Sized, const N: usize> {
+    data: core::cell::UnsafeCell<[T; N]>,
     head: AtomicUsize, // head = next index to be read
     tail: AtomicUsize, // tail = next index to be written
 }
@@ -82,8 +82,8 @@ pub struct Buffer<const N: usize> {
 /// the right to add data into the buffer.  Only one `Producer` may exist
 /// at one time for any given buffer.  The methods of a `Producer` are the
 /// only way to insert data into a `Buffer`.
-pub struct Producer<'a, const N: usize> {
-    buffer: &'a Buffer<N>,
+pub struct Producer<'a, T: Sized, const N: usize> {
+    buffer: &'a Buffer<T, N>,
     // The Producer is allowed to increment buffer.tail (up to a maximum
     // value of buffer.head + N), but may not modify buffer.head.
 }
@@ -92,8 +92,8 @@ pub struct Producer<'a, const N: usize> {
 /// the right to remove data from the buffer.  Only one `Consumer` may exist
 /// at one time for any given buffer.  The methods of a `Consumer` are the
 /// only way to read data out of a `Buffer`.
-pub struct Consumer<'a, const N: usize> {
-    buffer: &'a Buffer<N>,
+pub struct Consumer<'a, T: Sized, const N: usize> {
+    buffer: &'a Buffer<T, N>,
     // The Consumer is allowed to increment buffer.head (up to a maximum
     // value of buffer.tail), but may not modify buffer.tail.
 }
@@ -112,13 +112,13 @@ pub struct Consumer<'a, const N: usize> {
 /// one region for reading (referring to the consumer) and one region for writing
 /// (referring to the producer) can exist at any time. This is the mechanism by
 /// which thread safety for the ring buffer is enforced at compile time.
-pub struct Region<'b, T> {
-    region: &'b mut [u8],                // points to a subslice of Buffer.data
+pub struct Region<'b, O, T: Sized> {
+    region: &'b mut [T],                // points to a subslice of Buffer.data
     index_to_increment: &'b AtomicUsize, // points to Buffer.head or Buffer.tail
-    _owner: &'b mut T,                   // points to a Producer or Consumer
+    _owner: &'b mut O,                   // points to a Producer or Consumer
 }
 
-impl<const N: usize> Buffer<N> {
+impl<T: Sized, const N: usize> Buffer<T, N> {
     const SIZE_CHECK: () = assert!(
         (N != 0) && ((N - 1) & N == 0),
         "buffer size must be a power of 2"
@@ -128,7 +128,7 @@ impl<const N: usize> Buffer<N> {
         // Force a compile-time failure if N is not a power of 2.
         let _ = Self::SIZE_CHECK;
         Buffer {
-            data: core::cell::UnsafeCell::new([0; N]),
+            data: core::cell::UnsafeCell::new(unsafe { core::mem::zeroed() }),
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
         }
@@ -139,29 +139,29 @@ impl<const N: usize> Buffer<N> {
     /// reference is equal to the lifetimes of the producer and consumer which are
     /// returned.  Therefore, for a given buffer, only one producer and one consumer
     /// can exist at one time.
-    pub fn split(&mut self) -> (Producer<N>, Consumer<N>) {
+    pub fn split(&mut self) -> (Producer<T, N>, Consumer<T, N>) {
         (Producer { buffer: self }, Consumer { buffer: self })
     }
     /// Return a `Producer` associated with this buffer. UNSAFE: the caller must
     /// ensure that at most one `Producer` for this buffer exists at any time.
-    pub unsafe fn producer(&self) -> Producer<N> {
+    pub unsafe fn producer(&self) -> Producer<T, N> {
         Producer { buffer: self }
     }
     /// Return a `Consumer` associated with this buffer. UNSAFE: the caller must
     /// ensure that at most one `Consumer` for this buffer exists at any time.
-    pub unsafe fn consumer(&self) -> Consumer<N> {
+    pub unsafe fn consumer(&self) -> Consumer<T, N> {
         Consumer { buffer: self }
     }
 }
 
-impl<const N: usize> Buffer<N> {
+impl<T: Sized + Copy + Default, const N: usize> Buffer<T, N> {
     #[inline(always)]
-    fn calc_pointers(&self, indices: [usize; 2], target_len: usize) -> (*mut u8, usize, usize) {
+    fn calc_pointers(&self, indices: [usize; 2], target_len: usize) -> (*mut T, usize, usize) {
         // length calculations which are shared between `slice()` and `split_slice()`
         let [start, end] = indices;
         (
             // points to the element of Buffer.data at position `start`
-            unsafe { (self.data.get() as *mut u8).add(start & (N - 1)) },
+            unsafe { (self.data.get() as *mut T).add(start & (N - 1)) },
             // maximum length from `start` which doesn't wrap around
             N - (start & (N - 1)),
             // maximum length <= `target_len` which fits between `start` and `end`
@@ -173,73 +173,76 @@ impl<const N: usize> Buffer<N> {
     /// not wrap around the end of the buffer.  Start and end indices are wrapped to the
     /// buffer length.  UNSAFE: caller is responsible for ensuring that overlapping
     /// slices are never created, since we return a mutable (i.e. exclusive) slice.
-    unsafe fn slice(&self, indices: [usize; 2], target_len: usize) -> &mut [u8] {
+    unsafe fn slice(&self, indices: [usize; 2], target_len: usize) -> Result<&mut [T], ()> {
         let (start_ptr, wrap_len, len) = self.calc_pointers(indices, target_len);
-        core::slice::from_raw_parts_mut(start_ptr, core::cmp::min(len, wrap_len))
+        
+        // In the event that there technically is enough space in the buffer, but it is split across the buffer boundary,
+        // we want to try and get to the next contiguous region of memory by incrementing the index 
+        if len == target_len  &&  wrap_len < target_len {
+            self.tail.fetch_add(wrap_len, Relaxed);
+            return Err(());
+        }
+
+        Ok(core::slice::from_raw_parts_mut::<T>(start_ptr, core::cmp::min(len, wrap_len)))
     }
     /// Internal use only. Return a pair of u8 slices which are logically contiguous in
     /// the buffer, extending from `indices.0` to `indices.1`, except that the total
     /// length shall not exceed `target_len`. Start and end indices are wrapped to the
     /// buffer length.  UNSAFE: caller is responsible for ensuring that overlapping
     /// slices are never created, since we return mutable (i.e. exclusive) slices.
-    unsafe fn split_slice(&self, indices: [usize; 2], target_len: usize) -> [&mut [u8]; 2] {
+    unsafe fn split_slice(&self, indices: [usize; 2], target_len: usize) -> [&mut [T]; 2] {
         let (start_ptr, wrap_len, len) = self.calc_pointers(indices, target_len);
         if len <= wrap_len {
             [
-                core::slice::from_raw_parts_mut(start_ptr, 0),
-                core::slice::from_raw_parts_mut(start_ptr, len),
+                core::slice::from_raw_parts_mut::<T>(start_ptr, 0),
+                core::slice::from_raw_parts_mut::<T>(start_ptr, len),
             ]
         } else {
-            let data_ptr = self.data.get() as *mut u8;
+            let data_ptr = self.data.get() as *mut T;
             [
-                core::slice::from_raw_parts_mut(start_ptr, wrap_len),
-                core::slice::from_raw_parts_mut(data_ptr, len - wrap_len),
+                core::slice::from_raw_parts_mut::<T>(start_ptr, wrap_len),
+                core::slice::from_raw_parts_mut::<T>(data_ptr, len - wrap_len),
             ]
         }
     }
 }
 
-unsafe impl<const N: usize> Send for Buffer<N> {}
+unsafe impl<T: Sized + Copy + Default, const N: usize> Send for Buffer<T, N> {}
 /// `Buffer<N>` is `Send` and `Sync` because accesses to its internal data are
 /// only possible via a single `Producer` and a single `Consumer` at any time.
-unsafe impl<const N: usize> Sync for Buffer<N> {}
+unsafe impl<T: Sized + Copy + Default, const N: usize> Sync for Buffer<T, N> {}
 
-impl<'a, const N: usize> Producer<'a, N> {
+impl<'a, T: Sized + Copy + Default, const N: usize> Producer<'a, T, N> {
     fn indices(&self) -> [usize; 2] {
         [
             self.buffer.tail.load(Relaxed),
             self.buffer.head.load(Relaxed).wrapping_add(N),
         ]
     }
-    /// Return a `Region` for up to `target_len` bytes to be written into
-    /// the buffer. The returned region may be shorter than `target_len`.
-    /// The returned region has length zero if and only if the buffer is full.
-    /// The returned region is guaranteed to be not longer than `target_len`.
-    /// To write the largest possible length, set `target_len = usize::MAX`.
-    pub fn write<'b>(&'b mut self, target_len: usize) -> Region<'b, Self> {
-        Region {
-            region: unsafe { self.buffer.slice(self.indices(), target_len) },
-            index_to_increment: &self.buffer.tail,
-            _owner: self,
+    /// Return a `Region` for exactly `target_len * size_of::<T>()` contiguous
+    /// bytes to be written into the buffer, or `Err(())` if that many contiguous
+    /// bytes are not available. Because the returned region does not wrap around
+    /// the end of the buffer, this may fail even if the total free space is
+    /// sufficient (e.g. the free space is split across the buffer boundary).
+    pub fn write<'b>(&'b mut self, target_len: usize) -> Result<Region<'b, Self, T>, ()> {
+        let region = unsafe { self.buffer.slice(self.indices(), target_len) };
+        
+        match region {
+            Ok(region) => {
+                if region.len() == target_len {
+                    Ok(Region {
+                        region,
+                        index_to_increment: &self.buffer.tail,
+                        _owner: self,
+                    })
+                } else {
+                    Err(())
+                }
+            },
+            Err(_) => Err(()),
         }
     }
-    /// If the buffer has room for `*item`, write it into the buffer and return `Ok`.
-    /// Otherwise, return `Err`.
-    pub fn write_ref<T: ?Sized>(&mut self, item: &T) -> Result<(), ()> {
-        let src = unsafe {
-            core::slice::from_raw_parts(item as *const _ as *const u8, core::mem::size_of_val(item))
-        };
-        let dst = unsafe { self.buffer.split_slice(self.indices(), src.len()) };
-        if dst[0].len() + dst[1].len() == src.len() {
-            let (src0, src1) = src.split_at(dst[0].len());
-            dst[0].copy_from_slice(src0);
-            dst[1].copy_from_slice(src1);
-            self.buffer.tail.fetch_add(src.len(), Relaxed);
-            Ok(())
-        } else {
-            Err(())
-        }
-    }
+
     /// Return the amount of empty space currently available in the buffer.
     /// If the consumer is reading concurrently with this call, then the amount
     /// of empty space may increase, but it will not decrease below the value
@@ -250,14 +253,14 @@ impl<'a, const N: usize> Producer<'a, N> {
     }
 }
 
-impl<'a, const N: usize> Consumer<'a, N> {
+impl<'a, T: Sized + Copy + Default, const N: usize> Consumer<'a, T, N> {
     fn indices(&self) -> [usize; 2] {
         [
             self.buffer.head.load(Relaxed),
             self.buffer.tail.load(Relaxed),
         ]
     }
-    /// Return a `Region` for up to `target_len` bytes to be read from
+    /// Return a `Region` for up to `target_len` elements of type `T` to be read from
     /// the buffer. The returned region may be shorter than `target_len`.
     /// The returned region has length zero if and only if the buffer is empty.
     /// The returned region is guaranteed to be not longer than `target_len`.
@@ -266,31 +269,14 @@ impl<'a, const N: usize> Consumer<'a, N> {
     /// Even though we are reading from the buffer, the `Region` which is returned
     /// is mutable.  Its memory is available for arbitrary use by the caller
     /// for as long as the `Region` remains in scope.
-    pub fn read<'b>(&'b mut self, target_len: usize) -> Region<'b, Self> {
-        Region {
-            region: unsafe { self.buffer.slice(self.indices(), target_len) },
-            index_to_increment: &self.buffer.head,
-            _owner: self,
-        }
-    }
-    /// If the buffer contains enough bytes to make an instance of `T`, then write
-    /// them into `*item` and return `Ok`. Otherwise, return `Err`.  UNSAFE: caller
-    /// must guarantee that the bytes contained in the buffer constitute a valid
-    /// instance of `T`.  In consequence, if `T` is an integer type or an integer
-    /// array or slice type, then it is safe to call this function.
-    pub unsafe fn read_ref<T: Copy + ?Sized>(&mut self, item: &mut T) -> Result<(), ()> {
-        let dst = unsafe {
-            core::slice::from_raw_parts_mut(item as *mut _ as *mut u8, core::mem::size_of_val(item))
-        };
-        let src = unsafe { self.buffer.split_slice(self.indices(), dst.len()) };
-        if src[0].len() + src[1].len() == dst.len() {
-            let (dst0, dst1) = dst.split_at_mut(src[0].len());
-            dst0.copy_from_slice(src[0]);
-            dst1.copy_from_slice(src[1]);
-            self.buffer.head.fetch_add(dst.len(), Relaxed);
-            Ok(())
-        } else {
-            Err(())
+    pub fn read<'b>(&'b mut self, target_len: usize) -> Result<Region<'b, Self, T>, ()> {
+        match unsafe { self.buffer.slice(self.indices(), target_len) } {
+            Ok(region) => Ok(Region {
+                region,
+                index_to_increment: &self.buffer.head,
+                _owner: self,
+            }),
+            Err(_) => Err(()),
         }
     }
     /// Return the amount of data currently stored in the buffer.
@@ -311,7 +297,7 @@ impl<'a, const N: usize> Consumer<'a, N> {
     }
 }
 
-impl<'b, T> Region<'b, T> {
+impl<'b, O, T: Sized> Region<'b, O, T> {
     /// Update the buffer to indicate that the first `num` bytes of this region are
     /// finished being read or written.  The start and length of this region will be
     /// updated such that the remaining `region.len() - num` bytes remain in this
@@ -339,24 +325,25 @@ impl<'b, T> Region<'b, T> {
     }
 }
 
-impl<'b, T> Drop for Region<'b, T> {
+impl<'b, O, T: Sized> Drop for Region<'b, O, T> {
     /// Update the buffer to indicate that the memory being read or written is now
     /// ready for use. Dropping a `Region` requires a single addition operation to
     /// one field of the `Buffer`.
     fn drop(&mut self) {
-        self.index_to_increment.fetch_add(self.region.len(), Relaxed);
+        self.index_to_increment
+            .fetch_add(self.region.len(), Relaxed);
     }
 }
 
-impl<'b, T> core::ops::Deref for Region<'b, T> {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
+impl<'b, O, T: Sized> core::ops::Deref for Region<'b, O, T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
         self.region
     }
 }
 
-impl<'b, T> core::ops::DerefMut for Region<'b, T> {
-    fn deref_mut(&mut self) -> &mut [u8] {
+impl<'b, O, T: Sized> core::ops::DerefMut for Region<'b, O, T> {
+    fn deref_mut(&mut self) -> &mut [T] {
         self.region
     }
 }
@@ -365,24 +352,24 @@ impl<'b, T> core::ops::DerefMut for Region<'b, T> {
 fn index_wraparound() {
     // This can't be tested using the public interface because it would
     // take too long to get `head` and `tail` incremented to usize::MAX.
-    let mut b = Buffer::<64>::new();
+    let mut b = Buffer::<u8, 64>::new();
     b.head.fetch_sub(128, Relaxed);
     b.tail.fetch_sub(128, Relaxed);
     // Now b.head == b.tail == usize::MAX - 127
     let (mut p, mut c) = b.split();
     for _ in 0..4 {
         assert!(p.empty_size() == 64);
-        assert!(p.write(32).len() == 32);
+        assert!(p.write(32).unwrap().len() == 32);
         assert!(p.empty_size() == 32);
-        assert!(p.write(usize::MAX).len() == 32);
+        assert!(p.write(32).unwrap().len() == 32);
         assert!(p.empty_size() == 0);
-        assert!(p.write(usize::MAX).len() == 0);
+        assert!(p.write(1).is_err());
         assert!(c.data_size() == 64);
-        assert!(c.read(32).len() == 32);
+        assert!(c.read(32).unwrap().len() == 32);
         assert!(c.data_size() == 32);
-        assert!(c.read(usize::MAX).len() == 32);
+        assert!(c.read(usize::MAX).unwrap().len() == 32);
         assert!(c.data_size() == 0);
-        assert!(c.read(usize::MAX).len() == 0);
+        assert!(c.read(usize::MAX).unwrap().len() == 0);
     }
     assert!(b.head.load(Relaxed) == 128);
     assert!(b.tail.load(Relaxed) == 128);
