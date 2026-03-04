@@ -11,7 +11,7 @@ fn producer(mut p: fring::Producer<T, N>) {
     println!("Producer thread started");
     let mut idx = 0;
     loop {
-        idx+=1;
+        idx += 1;
         std::thread::sleep(std::time::Duration::from_millis(25));
         let data = [
             Test {
@@ -34,7 +34,7 @@ fn producer(mut p: fring::Producer<T, N>) {
                 Ok(region) => break region,
                 Err(_) => {
                     std::thread::yield_now();
-                },
+                }
             }
         };
 

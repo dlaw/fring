@@ -19,10 +19,10 @@
 //! Example of safe threaded use:
 //! ```rust
 //! # const N: usize = 8;
-//! # fn make_data(_: fring::Producer<N>) {}
-//! # fn use_data(_: fring::Consumer<N>) {}
+//! # fn make_data(_: fring::Producer<u8, N>) {}
+//! # fn use_data(_: fring::Consumer<u8, N>) {}
 //! fn main() {
-//!     let mut buffer = fring::Buffer::<N>::new();
+//!     let mut buffer = fring::Buffer::<u8, N>::new();
 //!     let (producer, consumer) = buffer.split();
 //!     std::thread::scope(|s| {
 //!         s.spawn(|| {
@@ -36,9 +36,9 @@
 //! Example of static use (requires `unsafe`):
 //! ```rust
 //! # const N: usize = 8;
-//! # fn write_data(_: fring::Producer<N>) {}
-//! # fn use_data(_: fring::Consumer<N>) {}
-//! static BUFFER: fring::Buffer<N> = fring::Buffer::new();
+//! # fn write_data(_: fring::Producer<u8, N>) {}
+//! # fn use_data(_: fring::Consumer<u8, N>) {}
+//! static BUFFER: fring::Buffer<u8, N> = fring::Buffer::new();
 //!
 //! fn interrupt_handler() {
 //!     // UNSAFE: this is safe because this is the only place we ever
@@ -59,10 +59,10 @@
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 
-/// A `Buffer<N>` consists of a `[u8; N]` array along with two `usize`
+/// A `Buffer<N>` consists of a `[T; N]` array along with two `usize`
 /// indices into the array.  `N` must be a power of two.  (If you need more
 /// flexibility with sizing, consider using a `bbqueue::BBBuffer` instead.)
-/// A `Buffer<N>` can hold `N` bytes of data and guarantees FIFO ordering.
+/// A `Buffer<N>` can hold `N` elements of type `T` and guarantees FIFO ordering.
 /// The only way to use a `Buffer` is to split it into a [`Producer`] and a
 /// [`Consumer`], which may then be passed to different threads or contexts.
 pub struct Buffer<T: Sized, const N: usize> {
@@ -101,7 +101,7 @@ pub struct Consumer<'a, T: Sized, const N: usize> {
 }
 
 /// A `Region` is a smart pointer to a specific region of data in a [`Buffer`].
-/// The `Region` derefs to `[u8]` and may generally be used in the same way as
+/// The `Region` derefs to `[T]` and may generally be used in the same way as
 /// a slice (e.g. `region[i]`, `region.len()`).  When a `Region` is dropped,
 /// it updates the associated `Buffer` to indicate that this section of the
 /// buffer is finished being read or written.  If a `Region` is forgotten
@@ -109,13 +109,13 @@ pub struct Consumer<'a, T: Sized, const N: usize> {
 /// be re-issued by the next read/write.
 ///
 /// A Region holds a mutable (i.e. exclusive) reference to its owner (of type
-/// `T`), which is either a `Producer` (for writing to a buffer) or a `Consumer`
+/// `O`), which is either a `Producer` (for writing to a buffer) or a `Consumer`
 /// (for reading from a buffer). Therefore, for a given buffer, at most
 /// one region for reading (referring to the consumer) and one region for writing
 /// (referring to the producer) can exist at any time. This is the mechanism by
 /// which thread safety for the ring buffer is enforced at compile time.
 pub struct Region<'b, O, T: Sized> {
-    region: &'b mut [T],                // points to a subslice of Buffer.data
+    region: &'b mut [T],                 // points to a subslice of Buffer.data
     index_to_increment: &'b AtomicUsize, // points to Buffer.head or Buffer.tail
     _owner: &'b mut O,                   // points to a Producer or Consumer
 }
@@ -172,7 +172,7 @@ impl<T: Sized + Copy + Default, const N: usize> Buffer<T, N> {
             core::cmp::min(target_len, end.wrapping_sub(start)),
         )
     }
-    /// Internal use only. Return a u8 slice extending from `indices.0` to `indices.1`,
+    /// Internal use only. Return a T slice extending from `indices.0` to `indices.1`,
     /// except that the slice shall not be longer than `target_len`, and the slice shall
     /// not wrap around the end of the buffer.  Start and end indices are wrapped to the
     /// buffer length.  UNSAFE: caller is responsible for ensuring that overlapping
@@ -196,9 +196,9 @@ impl<'a, T: Sized + Copy + Default, const N: usize> Producer<'a, T, N> {
             self.buffer.head.load(Relaxed).wrapping_add(N),
         ]
     }
-    /// Return a `Region` for exactly `target_len * size_of::<T>()` contiguous
-    /// bytes to be written into the buffer, or `Err(())` if that many contiguous
-    /// bytes are not available. Because the returned region does not wrap around
+    /// Return a `Region` for exactly `target_len` in a contiguous buffer if possible
+    /// Elements of type `T` to be written into the buffer, or `Err(())` if that many contiguous
+    /// elements are not available. Because the returned region does not wrap around
     /// the end of the buffer, this may fail even if the total free space is
     /// sufficient (e.g. the free space is split across the buffer boundary).
     pub fn write<'b>(&'b mut self, target_len: usize) -> Result<Region<'b, Self, T>, ()> {
@@ -283,12 +283,12 @@ impl<'a, T: Sized + Copy + Default, const N: usize> Consumer<'a, T, N> {
                         _owner: self,
                     });
                 }
-                // Head is at watermark — skip past the gap
+                // Head is at watermark - skip past the gap
                 let gap = N - (head & (N - 1));
                 self.buffer.head.fetch_add(gap, Relaxed);
                 self.buffer.has_watermark.store(false, Relaxed);
             } else {
-                // Stale watermark — clear it
+                // Stale watermark - clear it
                 self.buffer.has_watermark.store(false, Relaxed);
             }
         }
