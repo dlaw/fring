@@ -158,7 +158,7 @@ impl<T: Sized, const N: usize> Buffer<T, N> {
     }
 }
 
-impl<T: Sized + Copy + Default, const N: usize> Buffer<T, N> {
+impl<T: Sized, const N: usize> Buffer<T, N> {
     #[inline(always)]
     fn calc_pointers(&self, indices: [usize; 2], target_len: usize) -> (*mut T, usize, usize) {
         // length calculations which are shared between `slice()` and `split_slice()`
@@ -184,12 +184,12 @@ impl<T: Sized + Copy + Default, const N: usize> Buffer<T, N> {
     }
 }
 
-unsafe impl<T: Sized + Copy + Default, const N: usize> Send for Buffer<T, N> {}
+unsafe impl<T: Sized, const N: usize> Send for Buffer<T, N> {}
 /// `Buffer<N>` is `Send` and `Sync` because accesses to its internal data are
 /// only possible via a single `Producer` and a single `Consumer` at any time.
-unsafe impl<T: Sized + Copy + Default, const N: usize> Sync for Buffer<T, N> {}
+unsafe impl<T: Sized, const N: usize> Sync for Buffer<T, N> {}
 
-impl<'a, T: Sized + Copy + Default, const N: usize> Producer<'a, T, N> {
+impl<'a, T: Sized, const N: usize> Producer<'a, T, N> {
     fn indices(&self) -> [usize; 2] {
         [
             self.buffer.tail.load(Relaxed),
@@ -249,7 +249,7 @@ impl<'a, T: Sized + Copy + Default, const N: usize> Producer<'a, T, N> {
     }
 }
 
-impl<'a, T: Sized + Copy + Default, const N: usize> Consumer<'a, T, N> {
+impl<'a, T: Sized, const N: usize> Consumer<'a, T, N> {
     fn indices(&self) -> [usize; 2] {
         [
             self.buffer.head.load(Relaxed),
