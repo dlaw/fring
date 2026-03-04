@@ -57,7 +57,7 @@
 
 #![no_std]
 
-use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 
 /// A `Buffer<N>` consists of a `[u8; N]` array along with two `usize`
 /// indices into the array.  `N` must be a power of two.  (If you need more
@@ -67,8 +67,10 @@ use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 /// [`Consumer`], which may then be passed to different threads or contexts.
 pub struct Buffer<T: Sized, const N: usize> {
     data: core::cell::UnsafeCell<[T; N]>,
-    head: AtomicUsize, // head = next index to be read
-    tail: AtomicUsize, // tail = next index to be written
+    head: AtomicUsize,         // head = next index to be read
+    tail: AtomicUsize,         // tail = next index to be written
+    watermark: AtomicUsize,    // absolute index where a gap starts (valid when has_watermark)
+    has_watermark: AtomicBool, // true when a gap exists before the current tail
 }
 // `head` and `tail` are allowed to increment all the way to `usize::MAX`
 // and wrap around.  We maintain the invariants `0 <= tail - head <= N` and
@@ -131,6 +133,8 @@ impl<T: Sized, const N: usize> Buffer<T, N> {
             data: core::cell::UnsafeCell::new(unsafe { core::mem::zeroed() }),
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
+            watermark: AtomicUsize::new(0),
+            has_watermark: AtomicBool::new(false),
         }
     }
     /// Split the `Buffer` into a `Producer` and a `Consumer`.  This function is the
@@ -173,17 +177,10 @@ impl<T: Sized + Copy + Default, const N: usize> Buffer<T, N> {
     /// not wrap around the end of the buffer.  Start and end indices are wrapped to the
     /// buffer length.  UNSAFE: caller is responsible for ensuring that overlapping
     /// slices are never created, since we return a mutable (i.e. exclusive) slice.
-    unsafe fn slice(&self, indices: [usize; 2], target_len: usize) -> Result<&mut [T], ()> {
+    #[inline(always)]
+    unsafe fn slice(&self, indices: [usize; 2], target_len: usize) -> &mut [T] {
         let (start_ptr, wrap_len, len) = self.calc_pointers(indices, target_len);
-        
-        // In the event that there technically is enough space in the buffer, but it is split across the buffer boundary,
-        // we want to try and get to the next contiguous region of memory by incrementing the index 
-        if len == target_len  &&  wrap_len < target_len {
-            self.tail.fetch_add(wrap_len, Relaxed);
-            return Err(());
-        }
-
-        Ok(core::slice::from_raw_parts_mut::<T>(start_ptr, core::cmp::min(len, wrap_len)))
+        core::slice::from_raw_parts_mut(start_ptr, core::cmp::min(len, wrap_len))
     }
     /// Internal use only. Return a pair of u8 slices which are logically contiguous in
     /// the buffer, extending from `indices.0` to `indices.1`, except that the total
@@ -226,20 +223,39 @@ impl<'a, T: Sized + Copy + Default, const N: usize> Producer<'a, T, N> {
     /// sufficient (e.g. the free space is split across the buffer boundary).
     pub fn write<'b>(&'b mut self, target_len: usize) -> Result<Region<'b, Self, T>, ()> {
         let region = unsafe { self.buffer.slice(self.indices(), target_len) };
-        
-        match region {
-            Ok(region) => {
-                if region.len() == target_len {
-                    Ok(Region {
-                        region,
-                        index_to_increment: &self.buffer.tail,
-                        _owner: self,
-                    })
-                } else {
-                    Err(())
-                }
-            },
-            Err(_) => Err(()),
+        if region.len() == target_len {
+            return Ok(Region {
+                region,
+                index_to_increment: &self.buffer.tail,
+                _owner: self,
+            });
+        }
+
+        // Not enough contiguous space. Try to skip past the wrap boundary.
+        let [start, end] = self.indices();
+        let total = end.wrapping_sub(start);
+        let wrap_len = region.len();
+
+        if wrap_len > 0
+            && total >= target_len
+            && total - wrap_len >= target_len
+            && !self.buffer.has_watermark.load(Relaxed)
+        {
+            // Mark where valid data ends, then advance tail past the gap
+            self.buffer.watermark.store(start, Relaxed);
+            self.buffer.has_watermark.store(true, Relaxed);
+            self.buffer.tail.fetch_add(wrap_len, Relaxed);
+
+            // Retry from the new position (now at start of physical buffer)
+            let region = unsafe { self.buffer.slice(self.indices(), target_len) };
+            debug_assert!(region.len() == target_len);
+            Ok(Region {
+                region,
+                index_to_increment: &self.buffer.tail,
+                _owner: self,
+            })
+        } else {
+            Err(())
         }
     }
 
@@ -270,14 +286,39 @@ impl<'a, T: Sized + Copy + Default, const N: usize> Consumer<'a, T, N> {
     /// is mutable.  Its memory is available for arbitrary use by the caller
     /// for as long as the `Region` remains in scope.
     pub fn read<'b>(&'b mut self, target_len: usize) -> Result<Region<'b, Self, T>, ()> {
-        match unsafe { self.buffer.slice(self.indices(), target_len) } {
-            Ok(region) => Ok(Region {
-                region,
-                index_to_increment: &self.buffer.head,
-                _owner: self,
-            }),
-            Err(_) => Err(()),
+        // If there's an active watermark (gap from a producer wrap-skip),
+        // limit the read so it doesn't cross into the gap.
+        if self.buffer.has_watermark.load(Relaxed) {
+            let watermark = self.buffer.watermark.load(Relaxed);
+            let head = self.buffer.head.load(Relaxed);
+            let tail = self.buffer.tail.load(Relaxed);
+
+            if watermark.wrapping_sub(head) < tail.wrapping_sub(head) {
+                // Watermark is between head and tail — limit read to it
+                let region = unsafe { self.buffer.slice([head, watermark], target_len) };
+                if region.len() > 0 {
+                    return Ok(Region {
+                        region,
+                        index_to_increment: &self.buffer.head,
+                        _owner: self,
+                    });
+                }
+                // Head is at watermark — skip past the gap
+                let gap = N - (head & (N - 1));
+                self.buffer.head.fetch_add(gap, Relaxed);
+                self.buffer.has_watermark.store(false, Relaxed);
+            } else {
+                // Stale watermark — clear it
+                self.buffer.has_watermark.store(false, Relaxed);
+            }
         }
+
+        let region = unsafe { self.buffer.slice(self.indices(), target_len) };
+        Ok(Region {
+            region,
+            index_to_increment: &self.buffer.head,
+            _owner: self,
+        })
     }
     /// Return the amount of data currently stored in the buffer.
     /// If the producer is writing concurrently with this call,
@@ -294,6 +335,7 @@ impl<'a, T: Sized + Copy + Default, const N: usize> Consumer<'a, T, N> {
         self.buffer
             .head
             .store(self.buffer.tail.load(Relaxed), Relaxed);
+        self.buffer.has_watermark.store(false, Relaxed);
     }
 }
 
