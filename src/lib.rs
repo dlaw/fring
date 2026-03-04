@@ -182,26 +182,6 @@ impl<T: Sized + Copy + Default, const N: usize> Buffer<T, N> {
         let (start_ptr, wrap_len, len) = self.calc_pointers(indices, target_len);
         core::slice::from_raw_parts_mut(start_ptr, core::cmp::min(len, wrap_len))
     }
-    /// Internal use only. Return a pair of u8 slices which are logically contiguous in
-    /// the buffer, extending from `indices.0` to `indices.1`, except that the total
-    /// length shall not exceed `target_len`. Start and end indices are wrapped to the
-    /// buffer length.  UNSAFE: caller is responsible for ensuring that overlapping
-    /// slices are never created, since we return mutable (i.e. exclusive) slices.
-    unsafe fn split_slice(&self, indices: [usize; 2], target_len: usize) -> [&mut [T]; 2] {
-        let (start_ptr, wrap_len, len) = self.calc_pointers(indices, target_len);
-        if len <= wrap_len {
-            [
-                core::slice::from_raw_parts_mut::<T>(start_ptr, 0),
-                core::slice::from_raw_parts_mut::<T>(start_ptr, len),
-            ]
-        } else {
-            let data_ptr = self.data.get() as *mut T;
-            [
-                core::slice::from_raw_parts_mut::<T>(start_ptr, wrap_len),
-                core::slice::from_raw_parts_mut::<T>(data_ptr, len - wrap_len),
-            ]
-        }
-    }
 }
 
 unsafe impl<T: Sized + Copy + Default, const N: usize> Send for Buffer<T, N> {}
