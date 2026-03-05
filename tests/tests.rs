@@ -4,15 +4,15 @@ use fring::Buffer;
 fn read_and_write() {
     let mut b: Buffer<u8, 2> = Buffer::new();
     let (mut p, mut c) = b.split();
-    let mut w = p.write(2).unwrap();
+    let mut w = p.write(usize::MAX);
     assert!(w.len() == 2);
     w[0] = 22;
     w[1] = 23;
-    let r = c.read(usize::MAX).unwrap();
+    let r = c.read(usize::MAX);
     assert!(r.len() == 0);
     drop(w);
     drop(r);
-    let r = c.read(usize::MAX).unwrap();
+    let r = c.read(usize::MAX);
     assert!(r.len() == 2);
     assert!(r[0] == 22);
     assert!(r[1] == 23);
@@ -23,8 +23,8 @@ fn producer_consumer() {
     let b: Buffer<u8, 2> = Buffer::new();
     let mut p = unsafe { b.producer() };
     let mut c = unsafe { b.consumer() };
-    p.write(1).unwrap()[0] = 22;
-    assert!(c.read(1).unwrap()[0] == 22);
+    p.write(1)[0] = 22;
+    assert!(c.read(1)[0] == 22);
 }
 
 #[test]
@@ -32,27 +32,19 @@ fn wrap_around() {
     let mut b: Buffer<u8, 32> = Buffer::new();
     let (mut p, mut c) = b.split();
     for i in 0..33 {
-        let mut written = 0;
-        while written < i {
-            let remaining = i - written;
-            // Try to write `remaining` bytes. The Result temporary (and its
-            // Region, if Ok) are dropped at the end of this statement,
-            // releasing the mutable borrow on `p`.
-            let ok = p.write(remaining).is_ok();
-            if ok {
-                written += remaining;
-            } else {
-                // Not enough contiguous space; write 1 byte to advance past wrap
-                p.write(1).unwrap();
-                written += 1;
-            }
+        let w = p.write(i);
+        let mut len = w.len();
+        drop(w);
+        if len != i {
+            let w = p.write(i - len);
+            len += w.len();
         }
-        assert!(written == i);
-        let r = c.read(usize::MAX).unwrap();
+        assert!(len == i);
+        let r = c.read(usize::MAX);
         let mut len = r.len();
         drop(r);
         if len != i {
-            let r = c.read(usize::MAX).unwrap();
+            let r = c.read(usize::MAX);
             len += r.len();
         }
         assert!(len == i);
@@ -63,9 +55,9 @@ fn wrap_around() {
 fn flush() {
     let mut b: Buffer<u8, 8> = Buffer::new();
     let (mut p, mut c) = b.split();
-    p.write(5).unwrap();
+    p.write(5);
     c.flush();
-    assert!(c.read(usize::MAX).unwrap().len() == 0);
+    assert!(c.read(usize::MAX).len() == 0);
 }
 
 #[test]
@@ -73,13 +65,13 @@ fn empty_size() {
     let mut b: Buffer<u8, 8> = Buffer::new();
     let (mut p, mut c) = b.split();
     assert!(p.empty_size() == 8);
-    p.write(5).unwrap();
+    p.write(5);
     assert!(p.empty_size() == 3);
-    p.write(3).unwrap();
+    p.write(5);
     assert!(p.empty_size() == 0);
-    c.read(5).unwrap();
+    c.read(5);
     assert!(p.empty_size() == 5);
-    c.read(3).unwrap();
+    c.read(5);
     assert!(p.empty_size() == 8);
 }
 
@@ -88,13 +80,13 @@ fn data_size() {
     let mut b: Buffer<u8, 8> = Buffer::new();
     let (mut p, mut c) = b.split();
     assert!(c.data_size() == 0);
-    p.write(5).unwrap();
+    p.write(5);
     assert!(c.data_size() == 5);
-    p.write(3).unwrap();
+    p.write(5);
     assert!(c.data_size() == 8);
-    c.read(5).unwrap();
+    c.read(5);
     assert!(c.data_size() == 3);
-    c.read(3).unwrap();
+    c.read(5);
     assert!(c.data_size() == 0);
 }
 
@@ -102,10 +94,10 @@ fn data_size() {
 fn consume() {
     let mut b: Buffer<u8, 4> = Buffer::new();
     let (mut p, mut c) = b.split();
-    p.write(1).unwrap()[0] = 1;
-    p.write(1).unwrap()[0] = 2;
-    p.write(1).unwrap()[0] = 3;
-    let mut r = c.read(usize::MAX).unwrap();
+    p.write(1)[0] = 1;
+    p.write(1)[0] = 2;
+    p.write(1)[0] = 3;
+    let mut r = c.read(usize::MAX);
     assert!(r.len() == 3);
     r.consume(1);
     assert!(r.len() == 2);
@@ -118,8 +110,8 @@ fn consume() {
 fn bad_consume() {
     let mut b: Buffer<u8, 4> = Buffer::new();
     let (mut p, mut c) = b.split();
-    p.write(2).unwrap();
-    let mut r = c.read(usize::MAX).unwrap();
+    p.write(2);
+    let mut r = c.read(usize::MAX);
     r.consume(3);
 }
 
@@ -127,7 +119,7 @@ fn bad_consume() {
 fn partial_drop() {
     let mut b: Buffer<u8, 4> = Buffer::new();
     let (mut p, c) = b.split();
-    let w = p.write(3).unwrap();
+    let w = p.write(3);
     w.partial_drop(1);
     assert!(c.data_size() == 1);
 }
@@ -137,7 +129,7 @@ fn partial_drop() {
 fn bad_partial_drop() {
     let mut b: Buffer<u8, 4> = Buffer::new();
     let (mut p, _) = b.split();
-    let w = p.write(2).unwrap();
+    let w = p.write(2);
     w.partial_drop(3);
 }
 
@@ -145,11 +137,11 @@ fn bad_partial_drop() {
 fn zero_sized_ops() {
     let mut b: Buffer<u8, 4> = Buffer::new();
     let (mut p, mut c) = b.split();
-    p.write(1).unwrap();
-    let mut r = c.read(0).unwrap();
+    p.write(1);
+    let mut r = c.read(0);
     r.consume(0);
     r.partial_drop(0);
     assert!(c.data_size() == 1);
-    p.write(0).unwrap();
+    p.write(0);
     assert!(p.empty_size() == 3);
 }

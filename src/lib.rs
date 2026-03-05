@@ -69,8 +69,6 @@ pub struct Buffer<T: Sized, const N: usize> {
     data: core::cell::UnsafeCell<[T; N]>,
     head: AtomicUsize,         // head = next index to be read
     tail: AtomicUsize,         // tail = next index to be written
-    watermark: AtomicUsize,    // absolute index where a gap starts (valid when has_watermark)
-    has_watermark: AtomicBool, // true when a gap exists before the current tail
 }
 // `head` and `tail` are allowed to increment all the way to `usize::MAX`
 // and wrap around.  We maintain the invariants `0 <= tail - head <= N` and
@@ -133,8 +131,6 @@ impl<T: Sized, const N: usize> Buffer<T, N> {
             data: core::cell::UnsafeCell::new(unsafe { core::mem::zeroed() }),
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
-            watermark: AtomicUsize::new(0),
-            has_watermark: AtomicBool::new(false),
         }
     }
     /// Split the `Buffer` into a `Producer` and a `Consumer`.  This function is the
@@ -196,46 +192,16 @@ impl<'a, T: Sized, const N: usize> Producer<'a, T, N> {
             self.buffer.head.load(Relaxed).wrapping_add(N),
         ]
     }
-    /// Return a `Region` for exactly `target_len` in a contiguous buffer if possible
-    /// Elements of type `T` to be written into the buffer, or `Err(())` if that many contiguous
-    /// elements are not available. Because the returned region does not wrap around
-    /// the end of the buffer, this may fail even if the total free space is
-    /// sufficient (e.g. the free space is split across the buffer boundary).
-    pub fn write<'b>(&'b mut self, target_len: usize) -> Result<Region<'b, Self, T>, ()> {
-        let region = unsafe { self.buffer.slice(self.indices(), target_len) };
-        if region.len() == target_len {
-            return Ok(Region {
-                region,
-                index_to_increment: &self.buffer.tail,
-                _owner: self,
-            });
-        }
-
-        // Not enough contiguous space. Try to skip past the wrap boundary.
-        let [start, end] = self.indices();
-        let total = end.wrapping_sub(start);
-        let wrap_len = region.len();
-
-        if wrap_len > 0
-            && total >= target_len
-            && total - wrap_len >= target_len
-            && !self.buffer.has_watermark.load(Relaxed)
-        {
-            // Mark where valid data ends, then advance tail past the gap
-            self.buffer.watermark.store(start, Relaxed);
-            self.buffer.has_watermark.store(true, Relaxed);
-            self.buffer.tail.fetch_add(wrap_len, Relaxed);
-
-            // Retry from the new position (now at start of physical buffer)
-            let region = unsafe { self.buffer.slice(self.indices(), target_len) };
-            debug_assert!(region.len() == target_len);
-            Ok(Region {
-                region,
-                index_to_increment: &self.buffer.tail,
-                _owner: self,
-            })
-        } else {
-            Err(())
+    /// Return a `Region` for up to `target_len` elements to be written into
+    /// the buffer. The returned region may be shorter than `target_len`.
+    /// The returned region has length zero if and only if the buffer is full.
+    /// The returned region is guaranteed to be not longer than `target_len`.
+    /// To write the largest possible length, set `target_len = usize::MAX`.
+    pub fn write<'b>(&'b mut self, target_len: usize) -> Region<'b, Self, T> {
+        Region {
+            region: unsafe { self.buffer.slice(self.indices(), target_len) },
+            index_to_increment: &self.buffer.tail,
+            _owner: self,
         }
     }
 
@@ -256,7 +222,7 @@ impl<'a, T: Sized, const N: usize> Consumer<'a, T, N> {
             self.buffer.tail.load(Relaxed),
         ]
     }
-    /// Return a `Region` for up to `target_len` elements of type `T` to be read from
+    /// Return a `Region` for up to `target_len` elements to be read from
     /// the buffer. The returned region may be shorter than `target_len`.
     /// The returned region has length zero if and only if the buffer is empty.
     /// The returned region is guaranteed to be not longer than `target_len`.
@@ -265,40 +231,12 @@ impl<'a, T: Sized, const N: usize> Consumer<'a, T, N> {
     /// Even though we are reading from the buffer, the `Region` which is returned
     /// is mutable.  Its memory is available for arbitrary use by the caller
     /// for as long as the `Region` remains in scope.
-    pub fn read<'b>(&'b mut self, target_len: usize) -> Result<Region<'b, Self, T>, ()> {
-        // If there's an active watermark (gap from a producer wrap-skip),
-        // limit the read so it doesn't cross into the gap.
-        if self.buffer.has_watermark.load(Relaxed) {
-            let watermark = self.buffer.watermark.load(Relaxed);
-            let head = self.buffer.head.load(Relaxed);
-            let tail = self.buffer.tail.load(Relaxed);
-
-            if watermark.wrapping_sub(head) < tail.wrapping_sub(head) {
-                // Watermark is between head and tail — limit read to it
-                let region = unsafe { self.buffer.slice([head, watermark], target_len) };
-                if region.len() > 0 {
-                    return Ok(Region {
-                        region,
-                        index_to_increment: &self.buffer.head,
-                        _owner: self,
-                    });
-                }
-                // Head is at watermark - skip past the gap
-                let gap = N - (head & (N - 1));
-                self.buffer.head.fetch_add(gap, Relaxed);
-                self.buffer.has_watermark.store(false, Relaxed);
-            } else {
-                // Stale watermark - clear it
-                self.buffer.has_watermark.store(false, Relaxed);
-            }
-        }
-
-        let region = unsafe { self.buffer.slice(self.indices(), target_len) };
-        Ok(Region {
-            region,
+    pub fn read<'b>(&'b mut self, target_len: usize) -> Region<'b, Self, T> {
+        Region {
+            region: unsafe { self.buffer.slice(self.indices(), target_len) },
             index_to_increment: &self.buffer.head,
             _owner: self,
-        })
+        }
     }
     /// Return the amount of data currently stored in the buffer.
     /// If the producer is writing concurrently with this call,
@@ -315,14 +253,13 @@ impl<'a, T: Sized, const N: usize> Consumer<'a, T, N> {
         self.buffer
             .head
             .store(self.buffer.tail.load(Relaxed), Relaxed);
-        self.buffer.has_watermark.store(false, Relaxed);
     }
 }
 
 impl<'b, O, T: Sized> Region<'b, O, T> {
-    /// Update the buffer to indicate that the first `num` bytes of this region are
+    /// Update the buffer to indicate that the first `num` elements of this region are
     /// finished being read or written.  The start and length of this region will be
-    /// updated such that the remaining `region.len() - num` bytes remain in this
+    /// updated such that the remaining `region.len() - num` elements remain in this
     /// region for future reading or writing.
     pub fn consume(&mut self, num: usize) {
         assert!(num <= self.region.len());
@@ -336,8 +273,8 @@ impl<'b, O, T: Sized> Region<'b, O, T> {
             )
         }
     }
-    /// Update the buffer to indicate that the first `num` bytes of this region are
-    /// finished being read or written, and the remaining `region.len() - num` bytes
+    /// Update the buffer to indicate that the first `num` elements of this region are
+    /// finished being read or written, and the remaining `region.len() - num` elements
     /// will not be used.  `region.partial_drop(0)` is equivalent to
     /// `core::mem::forget(region)`.
     pub fn partial_drop(self, num: usize) {
@@ -381,17 +318,17 @@ fn index_wraparound() {
     let (mut p, mut c) = b.split();
     for _ in 0..4 {
         assert!(p.empty_size() == 64);
-        assert!(p.write(32).unwrap().len() == 32);
+        assert!(p.write(32).len() == 32);
         assert!(p.empty_size() == 32);
-        assert!(p.write(32).unwrap().len() == 32);
+        assert!(p.write(usize::MAX).len() == 32);
         assert!(p.empty_size() == 0);
-        assert!(p.write(1).is_err());
+        assert!(p.write(usize::MAX).len() == 0);
         assert!(c.data_size() == 64);
-        assert!(c.read(32).unwrap().len() == 32);
+        assert!(c.read(32).len() == 32);
         assert!(c.data_size() == 32);
-        assert!(c.read(usize::MAX).unwrap().len() == 32);
+        assert!(c.read(usize::MAX).len() == 32);
         assert!(c.data_size() == 0);
-        assert!(c.read(usize::MAX).unwrap().len() == 0);
+        assert!(c.read(usize::MAX).len() == 0);
     }
     assert!(b.head.load(Relaxed) == 128);
     assert!(b.tail.load(Relaxed) == 128);

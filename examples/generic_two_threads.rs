@@ -27,45 +27,24 @@ fn producer(mut p: fring::Producer<T, N>) {
                 another_field: (idx + 2) as f32 + 5.0,
             },
         ];
-        // Retry until 3 bytes can be written (buffer may be full or the write
-        // may straddle the buffer boundary).
-        let mut region = loop {
-            match p.write(3) {
-                Ok(region) => break region,
-                Err(_) => {
-                    std::thread::yield_now();
-                }
-            }
-        };
+        let mut w = p.write(3);
+        for i in 0..w.len() {
+            w[i] = data[i];
+        }
 
-        region[0] = data[0];
-        region[1] = data[1];
-        region[2] = data[2];
-
-        println!("write \"{:?} {:?} {:?}\"", region[0], region[1], region[2]);
+        println!("write \"{:?} {:?} {:?}\"", data[0], data[1], data[2]);
     }
 }
 
 fn consumer(mut c: fring::Consumer<T, N>) {
     loop {
         std::thread::sleep(std::time::Duration::from_millis(60));
-        match c.read(usize::MAX) {
-            Ok(r) => {
-                if r.len() == 0 {
-                    // buffer is empty
-                    break;
-                }
-                if r.len() >= 3 {
-                    for i in r.iter() {
-                        println!("read \"{:?}\"", i);
-                    }
-                }
-            }
-            Err(_) => {
-                // buffer is empty
-                break;
-            }
+        let r = c.read(usize::MAX);
+        if r.len() == 0 {
+            // buffer is empty
+            break;
         }
+        println!("            read \"{:?} {:?} {:?}\"", r[0], r[1], r[2]);
     }
 }
 
