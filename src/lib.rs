@@ -56,8 +56,9 @@
 //! ```
 
 #![no_std]
+#![allow(clippy::new_without_default)]
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 /// A `Buffer<N>` consists of a `[T; N]` array along with two `usize`
 /// indices into the array.  `N` must be a power of two.  (If you need more
@@ -67,8 +68,8 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 /// [`Consumer`], which may then be passed to different threads or contexts.
 pub struct Buffer<T: Sized, const N: usize> {
     data: core::cell::UnsafeCell<[T; N]>,
-    head: AtomicUsize,         // head = next index to be read
-    tail: AtomicUsize,         // tail = next index to be written
+    head: AtomicUsize, // head = next index to be read
+    tail: AtomicUsize, // tail = next index to be written
 }
 // `head` and `tail` are allowed to increment all the way to `usize::MAX`
 // and wrap around.  We maintain the invariants `0 <= tail - head <= N` and
@@ -126,7 +127,8 @@ impl<T: Sized, const N: usize> Buffer<T, N> {
     /// Return a new, empty buffer. The memory backing the buffer is zero-initialized.
     pub const fn new() -> Self {
         // Force a compile-time failure if N is not a power of 2.
-        let _ = Self::SIZE_CHECK;
+        #[allow(path_statements)]
+        Self::SIZE_CHECK;
         Buffer {
             data: core::cell::UnsafeCell::new(unsafe { core::mem::zeroed() }),
             head: AtomicUsize::new(0),
@@ -139,17 +141,19 @@ impl<T: Sized, const N: usize> Buffer<T, N> {
     /// reference is equal to the lifetimes of the producer and consumer which are
     /// returned.  Therefore, for a given buffer, only one producer and one consumer
     /// can exist at one time.
-    pub fn split(&mut self) -> (Producer<T, N>, Consumer<T, N>) {
+    pub fn split(&mut self) -> (Producer<'_, T, N>, Consumer<'_, T, N>) {
         (Producer { buffer: self }, Consumer { buffer: self })
     }
-    /// Return a `Producer` associated with this buffer. UNSAFE: the caller must
-    /// ensure that at most one `Producer` for this buffer exists at any time.
-    pub unsafe fn producer(&self) -> Producer<T, N> {
+    /// Return a `Producer` associated with this buffer.
+    /// # Safety
+    /// Ensure that at most one `Producer` for this buffer exists at any time.
+    pub unsafe fn producer(&self) -> Producer<'_, T, N> {
         Producer { buffer: self }
     }
-    /// Return a `Consumer` associated with this buffer. UNSAFE: the caller must
-    /// ensure that at most one `Consumer` for this buffer exists at any time.
-    pub unsafe fn consumer(&self) -> Consumer<T, N> {
+    /// Return a `Consumer` associated with this buffer.
+    /// # Safety
+    /// Ensure that at most one `Consumer` for this buffer exists at any time.
+    pub unsafe fn consumer(&self) -> Consumer<'_, T, N> {
         Consumer { buffer: self }
     }
 }
@@ -174,6 +178,7 @@ impl<T: Sized, const N: usize> Buffer<T, N> {
     /// buffer length.  UNSAFE: caller is responsible for ensuring that overlapping
     /// slices are never created, since we return a mutable (i.e. exclusive) slice.
     #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
     unsafe fn slice(&self, indices: [usize; 2], target_len: usize) -> &mut [T] {
         let (start_ptr, wrap_len, len) = self.calc_pointers(indices, target_len);
         core::slice::from_raw_parts_mut(start_ptr, core::cmp::min(len, wrap_len))
