@@ -56,7 +56,6 @@
 //! ```
 
 #![no_std]
-#![allow(clippy::new_without_default)]
 
 use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
@@ -120,15 +119,15 @@ pub struct Region<'b, O, T: Sized> {
 }
 
 impl<T: Sized, const N: usize> Buffer<T, N> {
-    const SIZE_CHECK: () = assert!(
-        (N != 0) && ((N - 1) & N == 0),
-        "buffer size must be a power of 2"
-    );
     /// Return a new, empty buffer. The memory backing the buffer is zero-initialized.
     pub const fn new() -> Self {
         // Force a compile-time failure if N is not a power of 2.
-        #[allow(path_statements)]
-        Self::SIZE_CHECK;
+        const {
+            assert!(
+                (N != 0) && ((N - 1) & N == 0),
+                "buffer size must be a power of 2"
+            )
+        };
         Buffer {
             data: core::cell::UnsafeCell::new(unsafe { core::mem::zeroed() }),
             head: AtomicUsize::new(0),
@@ -156,9 +155,6 @@ impl<T: Sized, const N: usize> Buffer<T, N> {
     pub unsafe fn consumer(&self) -> Consumer<'_, T, N> {
         Consumer { buffer: self }
     }
-}
-
-impl<T: Sized, const N: usize> Buffer<T, N> {
     #[inline(always)]
     fn calc_pointers(&self, indices: [usize; 2], target_len: usize) -> (*mut T, usize, usize) {
         // length calculations which are shared between `slice()` and `split_slice()`
@@ -181,7 +177,14 @@ impl<T: Sized, const N: usize> Buffer<T, N> {
     #[allow(clippy::mut_from_ref)]
     unsafe fn slice(&self, indices: [usize; 2], target_len: usize) -> &mut [T] {
         let (start_ptr, wrap_len, len) = self.calc_pointers(indices, target_len);
-        core::slice::from_raw_parts_mut(start_ptr, core::cmp::min(len, wrap_len))
+        unsafe { core::slice::from_raw_parts_mut(start_ptr, core::cmp::min(len, wrap_len)) }
+    }
+}
+
+impl<T: Sized, const N: usize> Default for Buffer<T, N> {
+    /// The default value is an empty buffer.
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -209,7 +212,6 @@ impl<'a, T: Sized, const N: usize> Producer<'a, T, N> {
             _owner: self,
         }
     }
-
     /// Return the amount of empty space currently available in the buffer.
     /// If the consumer is reading concurrently with this call, then the amount
     /// of empty space may increase, but it will not decrease below the value
