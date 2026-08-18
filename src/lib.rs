@@ -57,6 +57,10 @@
 
 #![no_std]
 
+#[cfg(feature = "portable-atomic")]
+use portable_atomic::{AtomicUsize, Ordering::Relaxed};
+
+#[cfg(not(feature = "portable-atomic"))]
 use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 /// A `Buffer<N>` consists of a `[T; N]` array along with two `usize`
