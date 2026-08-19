@@ -16,6 +16,9 @@
 //! [`Consumer`].  Then one may call `Producer.write()` and `Consumer.read()`,
 //! or various other methods which are provided by `Producer` and `Consumer`.
 //!
+//! For targets which do not provide Rust native atomic types, the optional
+//! `portable-atomic` feature may be enabled to use the `portable-atomic` crate.
+//!
 //! Example of safe threaded use:
 //! ```rust
 //! # const N: usize = 8;
@@ -144,32 +147,31 @@ impl<T: Sized, const N: usize> Buffer<T, N> {
     /// reference is equal to the lifetimes of the producer and consumer which are
     /// returned.  Therefore, for a given buffer, only one producer and one consumer
     /// can exist at one time.
-    pub fn split(&mut self) -> (Producer<'_, T, N>, Consumer<'_, T, N>) {
+    pub const fn split(&mut self) -> (Producer<'_, T, N>, Consumer<'_, T, N>) {
         (Producer { buffer: self }, Consumer { buffer: self })
     }
     /// Return a `Producer` associated with this buffer.
     /// # Safety
     /// Ensure that at most one `Producer` for this buffer exists at any time.
-    pub unsafe fn producer(&self) -> Producer<'_, T, N> {
+    pub const unsafe fn producer(&self) -> Producer<'_, T, N> {
         Producer { buffer: self }
     }
     /// Return a `Consumer` associated with this buffer.
     /// # Safety
     /// Ensure that at most one `Consumer` for this buffer exists at any time.
-    pub unsafe fn consumer(&self) -> Consumer<'_, T, N> {
+    pub const unsafe fn consumer(&self) -> Consumer<'_, T, N> {
         Consumer { buffer: self }
     }
     #[inline(always)]
-    fn calc_pointers(&self, indices: [usize; 2], target_len: usize) -> (*mut T, usize, usize) {
+    fn calc_pointers(&self, [start, end]: [usize; 2], target_len: usize) -> (*mut T, usize, usize) {
         // length calculations which are shared between `slice()` and `split_slice()`
-        let [start, end] = indices;
         (
             // points to the element of Buffer.data at position `start`
             unsafe { (self.data.get() as *mut T).add(start & (N - 1)) },
-            // maximum length from `start` which doesn't wrap around
-            N - (start & (N - 1)),
-            // maximum length <= `target_len` which fits between `start` and `end`
-            core::cmp::min(target_len, end.wrapping_sub(start)),
+            // maximum length <= target_len from `start` which doesn't wrap around
+            core::cmp::min(target_len, N - (start & (N - 1))),
+            // maximum length which fits between `start` and `end`
+            end.wrapping_sub(start),
         )
     }
     /// Internal use only. Return a T slice extending from `indices.0` to `indices.1`,
@@ -180,8 +182,31 @@ impl<T: Sized, const N: usize> Buffer<T, N> {
     #[inline(always)]
     #[allow(clippy::mut_from_ref)]
     unsafe fn slice(&self, indices: [usize; 2], target_len: usize) -> &mut [T] {
-        let (start_ptr, wrap_len, len) = self.calc_pointers(indices, target_len);
-        unsafe { core::slice::from_raw_parts_mut(start_ptr, core::cmp::min(len, wrap_len)) }
+        let (start_ptr, wrap_len, max_len) = self.calc_pointers(indices, target_len);
+        unsafe { core::slice::from_raw_parts_mut(start_ptr, core::cmp::min(max_len, wrap_len)) }
+    }
+    /// Internal use only. Return a pair of T slices which are logically contiguous in
+    /// the buffer, extending from `indices.0` for a length of `target_len`, unless the
+    /// end of the slices would exceed `indices.1`. Start and end indices are wrapped to
+    /// the buffer length.  UNSAFE: caller is responsible for ensuring that overlapping
+    /// slices are never created, since we return mutable (i.e. exclusive) slices.
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn split_slice(&self, indices: [usize; 2], target_len: usize) -> Option<[&mut [T]; 2]> {
+        let (start_ptr, wrap_len, max_len) = self.calc_pointers(indices, target_len);
+        if max_len < target_len {
+            None
+        } else {
+            unsafe {
+                Some([
+                    core::slice::from_raw_parts_mut(start_ptr, wrap_len),
+                    core::slice::from_raw_parts_mut(
+                        self.data.get() as *mut T,
+                        target_len - wrap_len,
+                    ),
+                ])
+            }
+        }
     }
 }
 
@@ -226,6 +251,22 @@ impl<'a, T: Sized, const N: usize> Producer<'a, T, N> {
     }
 }
 
+impl<'a, T: Sized + Copy, const N: usize> Producer<'a, T, N> {
+    /// If the buffer has empty space of length at least `slice.len()` available,
+    /// copy `slice` into the buffer and return `Some(())`. Otherwise, return `None`.
+    ///
+    /// This is a convenience function which incurs a single copy of the slice data.
+    /// For zero-copy performance, use `.write()` to get one or more `Region` views.
+    pub fn write_slice(&mut self, slice: &[T]) -> Option<()> {
+        let [dst0, dst1] = unsafe { self.buffer.split_slice(self.indices(), slice.len())? };
+        let (src0, src1) = unsafe { slice.split_at_unchecked(dst0.len()) };
+        dst0.copy_from_slice(src0);
+        dst1.copy_from_slice(src1);
+        self.buffer.tail.fetch_add(slice.len(), Relaxed);
+        Some(())
+    }
+}
+
 impl<'a, T: Sized, const N: usize> Consumer<'a, T, N> {
     fn indices(&self) -> [usize; 2] {
         [
@@ -267,6 +308,22 @@ impl<'a, T: Sized, const N: usize> Consumer<'a, T, N> {
     }
 }
 
+impl<'a, T: Sized + Copy, const N: usize> Consumer<'a, T, N> {
+    /// If the buffer contains data of length at least `slice.len()`, transfer
+    /// that data into `slice` and return `Some(())`. Otherwise, return `None`.
+    ///
+    /// This is a convenience function which incurs a single copy of the slice data.
+    /// For zero-copy performance, use `.read()` to get one or more `Region` views.
+    pub fn read_slice(&mut self, slice: &mut [T]) -> Option<()> {
+        let [src0, src1] = unsafe { self.buffer.split_slice(self.indices(), slice.len())? };
+        let (dst0, dst1) = unsafe { slice.split_at_mut_unchecked(src0.len()) };
+        dst0.copy_from_slice(src0);
+        dst1.copy_from_slice(src1);
+        self.buffer.head.fetch_add(slice.len(), Relaxed);
+        Some(())
+    }
+}
+
 impl<'b, O, T: Sized> Region<'b, O, T> {
     /// Update the buffer to indicate that the first `num` elements of this region are
     /// finished being read or written.  The start and length of this region will be
@@ -275,19 +332,18 @@ impl<'b, O, T: Sized> Region<'b, O, T> {
     pub fn consume(&mut self, num: usize) {
         assert!(num <= self.region.len());
         self.index_to_increment.fetch_add(num, Relaxed);
-        // UNSAFE: this is safe because we are replacing self.region with a subslice
-        // of self.region, and it is constrained to keep the same lifetime.
         self.region = unsafe {
-            core::slice::from_raw_parts_mut(
-                self.region.as_mut_ptr().add(num),
-                self.region.len() - num,
-            )
+            // UNSAFE: we already asserted that num <= region.len()
+            let new_region = self.region.split_at_mut_unchecked(num).1;
+            // UNSAFE: we're replacing region with a subslice that retains the same lifetime
+            &mut *(new_region as *mut [T])
         }
     }
     /// Update the buffer to indicate that the first `num` elements of this region are
     /// finished being read or written, and the remaining `region.len() - num` elements
-    /// will not be used.  `region.partial_drop(0)` is equivalent to
-    /// `core::mem::forget(region)`.
+    /// should be retained in the buffer for future reading or left empty for future
+    /// writing. `region.partial_drop(0)` is equivalent to `core::mem::forget(region)`
+    /// and can be used to peek at data without actually removing it from the buffer.
     pub fn partial_drop(self, num: usize) {
         assert!(num <= self.region.len());
         self.index_to_increment.fetch_add(num, Relaxed);

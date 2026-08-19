@@ -19,6 +19,26 @@ fn read_and_write() {
 }
 
 #[test]
+fn read_and_write_slice() {
+    let mut b: Buffer<u32, 4> = Buffer::new();
+    let (mut p, mut c) = b.split();
+    let mut s = [0u32; 3];
+    for i in 1..10 {
+        p.write_slice(&[i, i + 10, i + 20]).unwrap();
+        assert!(p.write_slice(&[0; 2]).is_none());
+        assert!(c.data_size() == 3);
+        c.read_slice(&mut s).unwrap();
+        assert!(c.read_slice(&mut s[..1]).is_none());
+        c.read_slice(&mut s[..0]).unwrap();
+        assert!(c.data_size() == 0);
+        assert!(s == [i, i + 10, i + 20]);
+    }
+    p.write_slice(&[0; 4]).unwrap();
+    assert!(p.write_slice(&[0; 1]).is_none());
+    p.write_slice(&[0; 0]).unwrap();
+}
+
+#[test]
 fn producer_consumer() {
     let b: Buffer<u8, 2> = Buffer::new();
     let mut p = unsafe { b.producer() };
